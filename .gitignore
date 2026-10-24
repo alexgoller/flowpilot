@@ -1,0 +1,26 @@
+# Proprietary vendor artifacts: kept locally, never committed (`make original` re-extracts)
+*.rpm
+/original/
+
+# Local-only working material, never committed
+/re/
+/bin/
+/docs/superpowers/
+/tasks/
+
+# Rust
+target/
+
+# Python bytecode (tests/conformance)
+__pycache__/
+
+# Fuzzing (fuzz/README.md): only fuzz/seeds and fuzz/regressions are committed
+/fuzz/target/
+/fuzz/corpus/
+/fuzz/artifacts*/
+/fuzz/logs*/
+/fuzz/coverage/
+.superpowers/
+
+# Static release builds (tools/build-static.sh)
+/dist/

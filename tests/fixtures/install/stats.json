@@ -1,0 +1,102 @@
+{
+  "schema": "flowpilot.stats/v1",
+  "time": "2026-10-22T12:10:00Z",
+  "version": "0.9.0",
+  "started_at": "2026-10-22T08:00:00Z",
+  "uptime_seconds": 15000,
+  "instance_id": "3f2c9a1e-5b7d-4e8f-9a0b-1c2d3e4f5a6b",
+  "status": "ok",
+  "last_flow_at": "2026-10-22T12:09:59Z",
+  "collectors": [
+    {
+      "name": "netflow-dc1",
+      "parser": "netflow",
+      "datagrams": 182340,
+      "bytes": 255276000,
+      "flows_decoded": 5470200,
+      "flows_forwarded": 5401876,
+      "flows_dropped": {
+        "empty_address": 12,
+        "special_address": 68210,
+        "ipv6_extension": 0,
+        "icmp_with_port": 102
+      },
+      "decode_errors": 3,
+      "rejected_datagrams": 41,
+      "templates": 4,
+      "waiting_for_template": 0,
+      "template_store_evicted": 0,
+      "rate": { "m1": 364.8, "m5": 361.2, "m15": 358.9 },
+      "exporters": [
+        {
+          "address": "10.1.0.1",
+          "protocols": ["netflow_v9"],
+          "datagrams": 121560,
+          "flows": 3646800,
+          "decode_errors": 0,
+          "first_seen": "2026-10-22T08:00:03Z",
+          "last_seen": "2026-10-22T12:09:59Z",
+          "flows_per_second": 243.2,
+          "templates": 2,
+          "waiting_for_template": 0
+        },
+        {
+          "address": "2001:db8::1",
+          "protocols": ["ipfix"],
+          "datagrams": 60780,
+          "flows": 1823400,
+          "decode_errors": 3,
+          "first_seen": "2026-10-22T08:00:05Z",
+          "last_seen": "2026-10-22T12:09:58Z",
+          "flows_per_second": 121.6,
+          "templates": 2,
+          "waiting_for_template": 0
+        }
+      ],
+      "exporters_omitted": 0
+    }
+  ],
+  "aggregation": {
+    "window_flows": 218004,
+    "window_keys": 9120,
+    "last_flush_at": "2026-10-22T12:00:00Z",
+    "last_window_records": 9875,
+    "last_window_new_ips": 4
+  },
+  "uploads": {
+    "succeeded": 25,
+    "failed": { "503": 1 },
+    "records_uploaded": 241800,
+    "last_success_at": "2026-10-22T12:00:02Z",
+    "last_error": "HTTP 503 Service Unavailable",
+    "last_error_at": "2026-10-22T09:30:01Z",
+    "first_failure_since_success_at": null,
+    "removed_by_size_cap": 0,
+    "removed_by_retention": 0,
+    "queued_files": 0,
+    "queued_bytes": 0
+  },
+  "unmanaged_workloads": {
+    "dry_run": false,
+    "known_ips": 1840,
+    "last_refresh_at": "2026-10-22T12:00:05Z",
+    "last_refresh_ok": true,
+    "last_window": {
+      "candidates": 6,
+      "eligible": 2,
+      "created": 2,
+      "deferred": 0,
+      "errors": 0,
+      "labels_created": 0
+    },
+    "created_total": 31,
+    "created_today": 9,
+    "would_create_total": 0,
+    "deferred_total": 0,
+    "failed_total": 0,
+    "daily_cap": 100,
+    "per_window_cap": 20,
+    "burst_paused_since": null,
+    "disabled_reason": null
+  }
+}

@@ -1,0 +1,98 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Tag matches Cargo.toml version
+        run: |
+          want="v$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)"
+          if [ "$want" != "$GITHUB_REF_NAME" ]; then
+            echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $want" >&2
+            exit 1
+          fi
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo test --locked
+      - run: cargo clippy --locked --all-targets -- -D warnings
+
+  e2e:
+    needs: verify
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Differential test against the original FlowLink
+        run: |
+          # The vendor binary is proprietary and never committed, so a runner normally does not have it.
+          if [ ! -f original/usr/local/bin/flowlink ]; then
+            echo "SKIPPED: original/usr/local/bin/flowlink is not available in CI; run tests/e2e/run.sh locally before tagging."
+            exit 0
+          fi
+          tests/e2e/run.sh
+
+  build:
+    needs: [verify, e2e]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - run: tools/build-static.sh
+      - name: Smoke test the aarch64 binary under QEMU
+        run: |
+          docker run --rm --privileged tonistiigi/binfmt:qemu-v8.1.5 --install arm64
+          bin=$(ls dist/flowpilot-*-aarch64-linux)
+          docker run --rm --platform linux/arm64 -v "$PWD/dist:/dist:ro" debian:bookworm-slim "/dist/$(basename "$bin")" -version
+          cat > "$RUNNER_TEMP/smoke.yaml" <<'YAML'
+          pce_addr: pce.example.invalid:8443
+          org_id: 1
+          api_key: user:secret
+          data_directory: /tmp
+          consumers:
+            - name: netflow
+              parser: { type: netflow }
+              connectors:
+                - type: udp
+                  properties:
+                    ports: "2055"
+          YAML
+          docker run --rm --platform linux/arm64 -v "$PWD/dist:/dist:ro" -v "$RUNNER_TEMP:/smoke:ro" \
+            -e CONFIG_FILE=/smoke/smoke.yaml debian:bookworm-slim "/dist/$(basename "$bin")" -print-config
+      - name: Smoke test the x86_64 binary
+        run: |
+          bin=$(ls dist/flowpilot-*-x86_64-linux)
+          "$bin" -version
+          CONFIG_FILE="$RUNNER_TEMP/smoke.yaml" "$bin" -print-config >/dev/null
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist
+          path: |
+            dist/flowpilot-*-linux
+            dist/SHA256SUMS
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          name: dist
+          path: dist
+      - name: Publish the GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release create "$GITHUB_REF_NAME" --title "FlowPilot ${GITHUB_REF_NAME#v}" --generate-notes \
+            dist/flowpilot-*-x86_64-linux dist/flowpilot-*-aarch64-linux dist/SHA256SUMS install.sh LICENSE NOTICE

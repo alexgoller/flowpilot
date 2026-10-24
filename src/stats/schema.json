@@ -1,0 +1,11 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "interval_seconds": { "type": "integer", "minimum": 5 },
+    "log": { "type": "boolean" },
+    "legacy_metrics": { "type": "boolean" },
+    "http_listen": { "type": "string" },
+    "idle_warn_seconds": { "type": "integer", "minimum": 30 }
+  }
+}

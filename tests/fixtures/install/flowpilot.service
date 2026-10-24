@@ -1,0 +1,26 @@
+[Unit]
+Description=FlowPilot flow collector
+After=network-online.target
+Wants=network-online.target
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+User=flowpilot
+Group=flowpilot
+Environment=CONFIG_FILE=/etc/flowpilot/config.yaml
+ExecStart=/usr/local/bin/flowpilot
+Restart=always
+RestartSec=10
+# On a signal FlowPilot waits 5 s to drain, up to 5 s more for unmanaged workloads to save their state,
+# and up to about 32 s more to send the last file.
+TimeoutStopSec=60
+NoNewPrivileges=no
+ProtectSystem=strict
+PrivateTmp=yes
+ReadWritePaths=/var/lib/flowpilot
+AmbientCapabilities=CAP_NET_BIND_SERVICE
+
+[Install]
+WantedBy=multi-user.target

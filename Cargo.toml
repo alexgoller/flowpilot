@@ -1,0 +1,35 @@
+[package]
+name = "flowpilot"
+version = "0.9.0"
+edition = "2021"
+description = "Self-installing Rust collector that sends NetFlow, IPFIX and sFlow traffic to an Illumio PCE"
+license = "Apache-2.0"
+repository = "https://github.com/alexgoller/flowpilot"
+publish = false
+
+[dependencies]
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+crossbeam-channel = "0.5"
+flate2 = "1"
+ipnet = { version = "2", features = ["serde"] }
+jsonschema = { version = "0.30", default-features = false }
+libc = "0.2"
+lexopt = "0.3"
+prost = "0.13"
+reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls-native-roots"] }
+ring = "0.17"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+signal-hook = "0.3"
+socket2 = { version = "0.5", features = ["all"] }
+hickory-resolver = { version = "0.24", default-features = false, features = ["tokio-runtime"] }
+dialoguer = { version = "0.11", default-features = false, features = ["password"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true

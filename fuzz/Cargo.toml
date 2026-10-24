@@ -1,0 +1,78 @@
+[package]
+name = "flowpilot-fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+arbitrary = "1"
+crossbeam-channel = "0.5"
+libc = "0.2"
+libfuzzer-sys = "0.4"
+flowpilot = { path = ".." }
+
+# Isolated from the main crate: building or locking this crate never touches ../Cargo.lock.
+[workspace]
+members = ["."]
+
+[profile.release]
+debug = 1
+
+[[bin]]
+name = "netflow_datagram"
+path = "fuzz_targets/netflow_datagram.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ipfix_datagram"
+path = "fuzz_targets/ipfix_datagram.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sflow_datagram"
+path = "fuzz_targets/sflow_datagram.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "netflow_sequence"
+path = "fuzz_targets/netflow_sequence.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ipfix_sequence"
+path = "fuzz_targets/ipfix_sequence.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "ipfix_structured"
+path = "fuzz_targets/ipfix_structured.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "netflow_v9_structured"
+path = "fuzz_targets/netflow_v9_structured.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "sflow_structured"
+path = "fuzz_targets/sflow_structured.rs"
+test = false
+doc = false
+bench = false

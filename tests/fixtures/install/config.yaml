@@ -1,0 +1,56 @@
+pce_addr: pce.example.com:8443
+org_id: 3
+api_key: /etc/flowpilot/api_key
+verify_pce_cert: false
+data_directory: /var/lib/flowpilot
+consumers:
+- name: netflow
+  parser:
+    type: netflow
+  connectors:
+  - type: udp
+    properties:
+      ports: '2055'
+      remote_addrs: 192.0.2.10,192.0.2.11
+- name: ipfix
+  parser:
+    type: ipfix
+  connectors:
+  - type: udp
+    properties:
+      ports: '4739'
+- name: sflow
+  parser:
+    type: sflow
+  connectors:
+  - type: udp
+    properties:
+      ports: 6343,6344
+- name: text
+  parser:
+    type: text
+    properties:
+      src_ip: src
+      dst_ip: dst
+      dst_port: 4
+      protocol: proto
+      timestamp_format: mmm dd yyyy HH:MM:SS
+  connectors:
+  - type: udp
+    properties:
+      ports: '514'
+stats:
+  http_listen: 127.0.0.1:9180
+unmanaged_workloads:
+  enabled: true
+  dry_run: true
+  networks:
+  - 10.0.0.0/8
+  - 192.168.0.0/16
+  min_flows: 5
+  max_creates_per_window: 50
+  label_rules:
+  - cidr: 10.1.0.0/16
+    labels:
+      app: web
+      env: prod

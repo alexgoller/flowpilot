@@ -1,0 +1,40 @@
+{
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "enabled": { "type": "boolean" },
+    "dry_run": { "type": "boolean" },
+    "networks": { "type": "array", "items": { "type": "string" } },
+    "exclude_networks": { "type": "array", "items": { "type": "string" } },
+    "allow_broad_networks": { "type": "boolean" },
+    "min_flows": { "type": "integer" },
+    "flow_window_hours": { "type": "integer" },
+    "max_creates_per_window": { "type": "integer" },
+    "max_creates_per_day": { "type": "integer" },
+    "refresh_hours": { "type": "integer" },
+    "external_data_set": { "type": "string" },
+    "api_key": { "type": "string" },
+    "dns": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "enabled": { "type": "boolean" },
+        "servers": { "type": "array", "items": { "type": "string" } },
+        "timeout_ms": { "type": "integer" },
+        "concurrency": { "type": "integer" }
+      }
+    },
+    "label_rules": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["cidr", "labels"],
+        "properties": {
+          "cidr": { "type": "string" },
+          "labels": { "type": "object", "additionalProperties": { "type": "string" } }
+        }
+      }
+    }
+  }
+}

@@ -12,7 +12,7 @@ jobs:
   test:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -24,7 +24,7 @@ jobs:
     # Every crate in the release binaries has a licence listed in about.toml; a new one fails here, not at release.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: taiki-e/install-action@v2
         with:
@@ -35,7 +35,7 @@ jobs:
     # install.sh against shims, without network: the token never in an argv, and the download fallbacks.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - run: sh -n install.sh
       - run: sh tests/install/token_not_in_argv.sh
       - run: sh tests/install/install_sh_paths.sh
@@ -44,7 +44,7 @@ jobs:
     # The fuzz crate is isolated from the main one; make sure it still compiles against it.
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
         with:

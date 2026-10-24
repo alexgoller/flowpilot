@@ -1,0 +1,5 @@
+# Licences of the crates built into the release binaries (`cargo about generate about.hbs`).
+accepted = ["Apache-2.0", "MIT", "BSD-3-Clause", "ISC", "Unicode-3.0", "MIT-0"]
+targets = ["x86_64-unknown-linux-musl", "aarch64-unknown-linux-musl"]
+ignore-dev-dependencies = true
+ignore-build-dependencies = false

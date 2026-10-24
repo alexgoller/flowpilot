@@ -1,0 +1,19 @@
+# Third-party licences
+
+FlowPilot's release binaries include the Rust crates listed below. Each licence text is followed by the crates that
+use it. FlowPilot itself is licensed under Apache-2.0 (see LICENSE); code ported from Go and go-metrics is credited in
+NOTICE.
+
+{{#each licenses}}
+## {{{name}}}
+
+Used by:
+{{#each used_by}}
+- [{{crate.name}} {{crate.version}}]({{#if crate.repository}}{{crate.repository}}{{else}}https://crates.io/crates/{{crate.name}}{{/if}})
+{{/each}}
+
+```
+{{{text}}}
+```
+
+{{/each}}

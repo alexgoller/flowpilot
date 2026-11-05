@@ -75,7 +75,7 @@ pub struct Config {
 }
 
 /// A secret that never shows in `Debug` output.
-#[derive(Clone, PartialEq)]
+#[derive(Clone, Default, PartialEq)]
 pub struct Secret(pub String);
 
 impl std::fmt::Debug for Secret {

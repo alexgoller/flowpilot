@@ -2,3 +2,4 @@
 //! REST upload.
 
 pub mod gateway;
+pub mod bootstrap;

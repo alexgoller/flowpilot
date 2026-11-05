@@ -1,5 +1,5 @@
 //! Which gateway host Integrations mode connects to. The host is not in the source: a build can embed
-//! one through the `FLOWPILOT_INTEGRATIONS_GATEWAY` (and `FLOWPILOT_INTEGRATIONS_STAGING_DOMAIN`)
+//! one through the `FLOWPILOT_BUILD_GATEWAY` (and `FLOWPILOT_BUILD_GATEWAY_STAGING_DOMAIN`)
 //! environment variable at compile time, and `pce_kafka.gateway` overrides it at run time.
 
 use crate::config::PceKafka;
@@ -13,10 +13,10 @@ const fn non_empty(v: Option<&'static str>) -> Option<&'static str> {
 }
 
 /// The gateway host compiled into this build, if any.
-pub const BUILTIN_GATEWAY: Option<&str> = non_empty(option_env!("FLOWPILOT_INTEGRATIONS_GATEWAY"));
+pub const BUILTIN_GATEWAY: Option<&str> = non_empty(option_env!("FLOWPILOT_BUILD_GATEWAY"));
 /// The domain `env_override: stage` is resolved under, if this build has one.
 pub const BUILTIN_STAGING_DOMAIN: Option<&str> =
-    non_empty(option_env!("FLOWPILOT_INTEGRATIONS_STAGING_DOMAIN"));
+    non_empty(option_env!("FLOWPILOT_BUILD_GATEWAY_STAGING_DOMAIN"));
 
 pub const NO_GATEWAY: &str = "this build has no built-in Integrations gateway; set pce_kafka.gateway";
 

@@ -86,7 +86,7 @@ fn daemon(flags: cli::Flags) {
 
     let dir = std::fs::canonicalize(&cfg.data_directory).unwrap_or_else(|_| PathBuf::from(&cfg.data_directory));
     let spool = Arc::new(Spool::new(dir.clone(),cfg.file_retention_hours, cfg.data_directory_size_mb));
-    let agg = Arc::new(Aggregator::new(spool.clone(), &cfg.pce_addr, cfg.org_id, instance.clone(), cfg.max_flows_per_post));
+    let agg = Arc::new(Aggregator::new(spool.clone(), &cfg.pce_addr, cfg.org_id, instance.clone(), cfg.max_flows_per_post, None));
     let (tx, rx) = crossbeam_channel::bounded(FLOW_CHANNEL_CAPACITY);
     agg.start(rx);
     let _ = AGGREGATOR.set(agg.clone());

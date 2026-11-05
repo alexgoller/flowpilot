@@ -307,7 +307,7 @@ pub(crate) mod tests {
         let dir = tempfile::tempdir().unwrap();
         let uploads: &'static UploadStats = Box::leak(Box::new(UploadStats::new()));
         let spool = Arc::new(Spool::new(dir.path().to_path_buf(), 24, 500).with_stats(uploads));
-        let aggregator = Arc::new(Aggregator::new(spool.clone(), "pce.test:8443", 1, "uuid-1".into(), 10000));
+        let aggregator = Arc::new(Aggregator::new(spool.clone(), "pce.test:8443", 1, "uuid-1".into(), 10000, None));
         let ctx = SnapshotContext {
             version: "0.9.0".into(),
             instance_id: "uuid-1".into(),

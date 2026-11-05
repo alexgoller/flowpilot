@@ -1,7 +1,9 @@
 //! Flow aggregation and window flush.
 //!
-//! Only PCE (HTTP) mode is implemented. Kafka output is deferred, so the
-//! device address is always cleared from the key and records carry dst_dbi/dst_dbo.
+//! PCE (HTTP) mode clears the device address from the key, and records carry dst_dbi/dst_dbo.
+//! Kafka mode (a [`KafkaHeader`] is set) keeps the device address in the key, so each exporter
+//! aggregates on its own. Its batches carry org_id/installation_id/pce_host, and its records
+//! carry device_addr, the MACs, the mask bits and the summed octets instead of dst_dbi/dst_dbo.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::Write;
@@ -92,20 +94,38 @@ pub struct WindowReport {
     pub ip_flow_counts: HashMap<String, u64>,
 }
 
+/// The batch header fields of Kafka mode.
+#[derive(Clone, Debug)]
+pub struct KafkaHeader {
+    pub org_id: i32,
+    pub installation_id: String,
+    /// `pce_addr` verbatim, including `:port`.
+    pub pce_host: String,
+}
+
 pub struct Aggregator {
     window: Mutex<Window>,
     spool: Arc<Spool>,
     reported_store: ReportedIpsStore,
     instance_id: String,
     max_flows_per_post: i64,
+    /// `Some` in Kafka mode.
+    kafka: Option<KafkaHeader>,
 }
 
 impl Aggregator {
-    /// Create the aggregator and load persisted reported IPs.
-    pub fn new(spool: Arc<Spool>, pce_addr: &str, org_id: i32, instance_id: String, max_flows_per_post: i64) -> Self {
+    /// Create the aggregator and load persisted reported IPs. `kafka` selects Kafka mode.
+    pub fn new(
+        spool: Arc<Spool>,
+        pce_addr: &str,
+        org_id: i32,
+        instance_id: String,
+        max_flows_per_post: i64,
+        kafka: Option<KafkaHeader>,
+    ) -> Self {
         let reported_store = ReportedIpsStore::new(spool.dir(), pce_addr, org_id);
         let window = Window { reported_ips: reported_store.load(), ..Window::default() };
-        Self { window: Mutex::new(window), spool, reported_store, instance_id, max_flows_per_post }
+        Self { window: Mutex::new(window), spool, reported_store, instance_id, max_flows_per_post, kafka }
     }
 
     /// Starts ten aggregator consumers of the flow channel.
@@ -131,7 +151,9 @@ impl Aggregator {
         }
         w.flows_seen += 1;
         debug_log!("Handling flow:", fd);
-        fd.key.device_addr.clear();
+        if self.kafka.is_none() {
+            fd.key.device_addr.clear();
+        }
         let mut info = match w.flows.get(&fd.key) {
             Some(i) => *i,
             None => {
@@ -217,6 +239,8 @@ impl Aggregator {
 
         let mut max_per_post = self.max_flows_per_post;
         let mut final_flush = false;
+        // As in FlowLink: with max_per_post 0 (Kafka maxObjectsPerMessage absent) this is false, so the
+        // shutdown window is spooled but not sent.
         if shutdown() && self.spool.queue_len() == 0 && max_per_post >= flows.len() as i64 {
             max_per_post = flows.len() as i64;
             final_flush = true;
@@ -224,7 +248,7 @@ impl Aggregator {
         let aggregation_seconds = (max_t.saturating_sub(min_t) as f64).round() as i32;
         let mut entries = flows.into_iter();
         loop {
-            let batch = build_batch(&mut entries, max_per_post, aggregation_seconds, &self.instance_id);
+            let batch = build_batch(&mut entries, max_per_post, aggregation_seconds, &self.instance_id, self.kafka.as_ref());
             let Some(td) = batch else { break };
             let records = td.flows.len() as u64;
             let mut gz = GzEncoder::new(Vec::new(), Compression::best());
@@ -286,12 +310,19 @@ fn build_batch(
     max_per_post: i64,
     aggregation_seconds: i32,
     instance_id: &str,
+    kafka: Option<&KafkaHeader>,
 ) -> Option<UploadBatch> {
     let mut td = UploadBatch {
         aggregation_seconds,
         instance_id: Some(instance_id.as_bytes().to_vec()),
         ..Default::default()
     };
+    if let Some(k) = kafka {
+        // Always present in Kafka mode, even when 0 or empty.
+        td.org_id = Some(k.org_id);
+        td.installation_id = Some(k.installation_id.as_bytes().to_vec());
+        td.pce_host = Some(k.pce_host.as_bytes().to_vec());
+    }
     let mut any = false;
     for (key, value) in entries.by_ref() {
         any = true;
@@ -306,7 +337,7 @@ fn build_batch(
             continue;
         };
         let icmp = matches!(key.protocol, 1 | 58);
-        let rec = UploadRecord {
+        let mut rec = UploadRecord {
             timestamp: value.first_flow_time,
             src_ip,
             dst_ip,
@@ -315,10 +346,22 @@ fn build_batch(
             count: value.flow_count as i32,
             icmp_type: icmp.then_some(key.icmp_type as i32),
             icmp_code: icmp.then_some(key.icmp_code as i32),
-            dst_dbi: (value.flow_in_octets != 0).then_some(value.flow_in_octets),
-            dst_dbo: (value.flow_out_octets != 0).then_some(value.flow_out_octets),
             ..Default::default()
         };
+        if kafka.is_some() {
+            let opt = |s: &str, f: fn(&str) -> Option<Vec<u8>>| if s.is_empty() { None } else { f(s) };
+            rec.src_mac = opt(&key.src_mac, go_parse_mac);
+            rec.dst_mac = opt(&key.dst_mac, go_parse_mac);
+            rec.device_addr = opt(&key.device_addr, device_addr_bytes);
+            rec.src_mask_bits = (key.src_mask != 0).then_some(key.src_mask as i32);
+            rec.dst_mask_bits = (key.dst_mask != 0).then_some(key.dst_mask as i32);
+            // Direction is collapsed: in + out.
+            rec.octets = (value.flow_in_octets != 0 || value.flow_out_octets != 0)
+                .then(|| value.flow_in_octets.wrapping_add(value.flow_out_octets) as u64);
+        } else {
+            rec.dst_dbi = (value.flow_in_octets != 0).then_some(value.flow_in_octets);
+            rec.dst_dbo = (value.flow_out_octets != 0).then_some(value.flow_out_octets);
+        }
         debug_log!("flow:", format!("{rec:?}"));
         td.flows.push(rec);
         if td.flows.len() as i64 == max_per_post {
@@ -342,6 +385,63 @@ fn ip16_bytes(s: &str) -> Option<Vec<u8>> {
         IpAddr::V4(v) => Some(v.to_ipv6_mapped().octets().to_vec()),
         IpAddr::V6(v) => Some(v.octets().to_vec()),
     }
+}
+
+/// The Kafka record's device address: Go `net.ParseIP(s).To4()` if `s` contains a `.`, else `.To16()`.
+fn device_addr_bytes(s: &str) -> Option<Vec<u8>> {
+    if s.contains('.') {
+        ip4_bytes(s)
+    } else {
+        ip16_bytes(s)
+    }
+}
+
+/// Go `net.ParseMAC`: `aa:bb:..`, `aa-bb-..` or `aabb.ccdd.eeff` forms of 6, 8 or 20 bytes.
+pub(crate) fn go_parse_mac(s: &str) -> Option<Vec<u8>> {
+    let b = s.as_bytes();
+    if b.len() < 14 {
+        return None;
+    }
+    let hex = |i: usize| -> Option<u8> {
+        let d = |c: u8| (c as char).to_digit(16);
+        Some((d(*b.get(i)?)? * 16 + d(*b.get(i + 1)?)?) as u8)
+    };
+    let (n, out) = if b[2] == b':' || b[2] == b'-' {
+        if !(b.len() + 1).is_multiple_of(3) {
+            return None;
+        }
+        let n = (b.len() + 1) / 3;
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n {
+            let x = 3 * i;
+            if x + 2 < b.len() && b[x + 2] != b[2] {
+                return None;
+            }
+            out.push(hex(x)?);
+        }
+        (n, out)
+    } else if b[4] == b'.' {
+        if !(b.len() + 1).is_multiple_of(5) {
+            return None;
+        }
+        let n = 2 * (b.len() + 1) / 5;
+        let mut out = Vec::with_capacity(n);
+        for i in 0..n / 2 {
+            let x = 5 * i;
+            if x + 4 < b.len() && b[x + 4] != b'.' {
+                return None;
+            }
+            out.push(hex(x)?);
+            out.push(hex(x + 2)?);
+        }
+        (n, out)
+    } else {
+        return None;
+    };
+    if !matches!(n, 6 | 8 | 20) {
+        return None;
+    }
+    Some(out)
 }
 
 /// `restart_info.yml`. Divergence: truncated on write.
@@ -400,7 +500,7 @@ mod tests {
     }
 
     fn agg(dir: &Path, max: i64) -> Aggregator {
-        Aggregator::new(Arc::new(Spool::new(dir.to_path_buf(), 24, 500)), "pce.test:8443", 1, "uuid-1".into(), max)
+        Aggregator::new(Arc::new(Spool::new(dir.to_path_buf(), 24, 500)), "pce.test:8443", 1, "uuid-1".into(), max, None)
     }
 
     fn read_batches(dir: &Path) -> Vec<UploadBatch> {
@@ -515,7 +615,7 @@ mod tests {
     fn spool_files_carry_their_record_count() {
         let dir = tempfile::tempdir().unwrap();
         let spool = Arc::new(Spool::new(dir.path().to_path_buf(), 24, 500));
-        let a = Aggregator::new(spool.clone(), "pce.test:8443", 1, "uuid-1".into(), 2);
+        let a = Aggregator::new(spool.clone(), "pce.test:8443", 1, "uuid-1".into(), 2, None);
         for i in 1..=3 {
             a.add_flow(fd(&format!("10.0.1.{i}"), "10.0.2.1", 443, 0, 100, 0, 2));
         }
@@ -530,5 +630,118 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         assert_eq!(agg(dir.path(), 10000).write_flows(), WindowReport::default());
         assert!(read_batches(dir.path()).is_empty());
+    }
+
+    fn kagg(dir: &Path, max: i64) -> Aggregator {
+        let header = KafkaHeader { org_id: 1, installation_id: "inst-1".into(), pce_host: "pce.test:8443".into() };
+        Aggregator::new(Arc::new(Spool::new(dir.to_path_buf(), 24, 500)), "pce.test:8443", 1, "uuid-1".into(), max, Some(header))
+    }
+
+    #[test]
+    fn kafka_records_carry_device_macs_masks_and_octets() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = kagg(dir.path(), 10000);
+        let mut f = fd("10.0.0.1", "10.0.0.2", 443, 50000, 100, 15, 0);
+        f.key.src_mac = "00:11:22:33:44:55".into();
+        f.key.dst_mac = "bogus".into();
+        f.key.src_mask = 24;
+        a.add_flow(f);
+        // The reverse flow, same exporter: MACs and masks swap with the direction, so it folds.
+        let mut r = fd("10.0.0.2", "10.0.0.1", 50000, 443, 110, 7, 0);
+        r.key.src_mac = "bogus".into();
+        r.key.dst_mac = "00:11:22:33:44:55".into();
+        r.key.dst_mask = 24;
+        a.add_flow(r);
+        a.write_flows();
+        let td = read_batches(dir.path()).remove(0);
+        assert_eq!(
+            (td.org_id, td.installation_id.as_deref(), td.pce_host.as_deref()),
+            (Some(1), Some(&b"inst-1"[..]), Some(&b"pce.test:8443"[..]))
+        );
+        assert_eq!(td.instance_id.as_deref(), Some(&b"uuid-1"[..]));
+        assert_eq!(td.flows.len(), 1);
+        let r = &td.flows[0];
+        assert_eq!((r.count, r.octets, r.dst_dbi, r.dst_dbo), (2, Some(22), None, None));
+        assert_eq!(r.device_addr.as_deref(), Some(&[192, 0, 2, 1][..]));
+        assert_eq!((r.src_mac.as_deref(), r.dst_mac.as_ref()), (Some(&[0, 0x11, 0x22, 0x33, 0x44, 0x55][..]), None));
+        assert_eq!((r.src_mask_bits, r.dst_mask_bits), (Some(24), None));
+    }
+
+    #[test]
+    fn kafka_header_present_even_when_empty_and_zero_octets_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let header = KafkaHeader { org_id: 0, installation_id: String::new(), pce_host: String::new() };
+        let a = Aggregator::new(Arc::new(Spool::new(dir.path().to_path_buf(), 24, 500)), "", 0, "uuid-1".into(), 10000, Some(header));
+        a.add_flow(fd("10.0.0.1", "10.0.0.2", 443, 0, 100, 0, 2));
+        a.write_flows();
+        let td = read_batches(dir.path()).remove(0);
+        assert_eq!((td.org_id, td.installation_id.as_deref(), td.pce_host.as_deref()), (Some(0), Some(&b""[..]), Some(&b""[..])));
+        let r = &td.flows[0];
+        assert_eq!((r.octets, r.src_mac.as_ref(), r.src_mask_bits), (None, None, None));
+    }
+
+    #[test]
+    fn kafka_mode_keeps_exporters_apart() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = kagg(dir.path(), 10000);
+        let devices = ["192.0.2.1", "192.0.2.2", "2001:db8::9", "kafka1:9092"];
+        for dev in devices {
+            let mut f = fd("10.0.0.1", "10.0.0.2", 443, 50000, 100, 10, 0);
+            f.key.device_addr = dev.into();
+            f.seq_id = "5".into();
+            a.add_flow(f);
+        }
+        a.write_flows();
+        let td = read_batches(dir.path()).remove(0);
+        assert_eq!(td.flows.len(), 4);
+        let mut addrs: Vec<_> = td.flows.iter().map(|r| r.device_addr.clone()).collect();
+        addrs.sort();
+        assert_eq!(addrs, [None, Some(vec![32, 1, 13, 184, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 9]), Some(vec![192, 0, 2, 1]), Some(vec![192, 0, 2, 2])]);
+        assert!(td.flows.iter().all(|r| r.octets == Some(10)));
+        // Restart info is keyed by the real device address.
+        let restart = std::fs::read_to_string(dir.path().join("restart_info.yml")).unwrap();
+        for dev in devices {
+            assert!(restart.contains(dev), "{dev} missing from {restart}");
+        }
+    }
+
+    #[test]
+    fn rest_mode_clears_device_and_folds_exporters() {
+        let dir = tempfile::tempdir().unwrap();
+        let a = agg(dir.path(), 10000);
+        for dev in ["192.0.2.1", "192.0.2.2"] {
+            let mut f = fd("10.0.0.1", "10.0.0.2", 443, 50000, 100, 10, 0);
+            f.key.device_addr = dev.into();
+            a.add_flow(f);
+        }
+        a.write_flows();
+        let td = read_batches(dir.path()).remove(0);
+        assert_eq!(td.flows.len(), 1);
+        assert_eq!((td.flows[0].device_addr.as_ref(), td.flows[0].octets, td.flows[0].dst_dbi), (None, None, Some(20)));
+        assert_eq!((td.installation_id.as_ref(), td.pce_host.as_ref()), (None, None));
+    }
+
+    #[test]
+    fn go_parse_mac_forms() {
+        let eui48 = Some(vec![0, 0x11, 0x22, 0x33, 0x44, 0x55]);
+        assert_eq!(go_parse_mac("00:11:22:33:44:55"), eui48);
+        assert_eq!(go_parse_mac("00-11-22-33-44-55"), eui48);
+        assert_eq!(go_parse_mac("0011.2233.4455"), eui48);
+        assert_eq!(go_parse_mac("AA:bb:CC:dd:EE:ff"), Some(vec![0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff]));
+        assert_eq!(go_parse_mac("02:00:5e:10:00:00:00:01").map(|m| m.len()), Some(8));
+        assert_eq!(go_parse_mac("0200.5e10.0000.0001").map(|m| m.len()), Some(8));
+        let ipoib = "00:00:00:00:fe:80:00:00:00:00:00:00:02:00:5e:10:00:00:00:01";
+        assert_eq!(go_parse_mac(ipoib).map(|m| m.len()), Some(20));
+        for bad in ["", "bogus", "00:11:22:33:44", "00:11:22:33:44:55:66", "00:11-22:33:44:55", "00:11:22:33:44:5g", "0011.2233.445", "00112233445566"] {
+            assert_eq!(go_parse_mac(bad), None, "{bad}");
+        }
+    }
+
+    #[test]
+    fn device_addr_bytes_forms() {
+        assert_eq!(device_addr_bytes("192.0.2.1"), Some(vec![192, 0, 2, 1]));
+        assert_eq!(device_addr_bytes("::ffff:192.0.2.1"), Some(vec![192, 0, 2, 1]));
+        assert_eq!(device_addr_bytes("2001:db8::1").map(|b| b.len()), Some(16));
+        assert_eq!(device_addr_bytes("kafka1:9092"), None);
     }
 }

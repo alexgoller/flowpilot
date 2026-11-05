@@ -39,12 +39,13 @@ pub struct HttpProxy {
     pub no_proxy: String,
 }
 
-/// `pce_kafka` (PCE Kafka/Integrations mode is deferred; parsed for validation only).
+/// `pce_kafka`: PCE Kafka (Integrations) mode. `gateway` is a FlowPilot extension (see `kafka::gateway`).
 #[derive(Clone, Debug, Default, PartialEq)]
 pub struct PceKafka {
     pub installation_id: String,
     pub env_override: String,
     pub kafka_info: String,
+    pub gateway: String,
 }
 
 /// The whole configuration. Integer widths match FlowLink's (overflow silently becomes 0).
@@ -246,6 +247,11 @@ pub(crate) fn validate_doc(mut doc: Value, sources: &Sources) -> Result<Config, 
         let named: Vec<String> = errors.iter().map(|e| name_variable(e, &doc, sources)).collect();
         return Err(invalid(named.iter().map(|e| e.replace("/1", ""))));
     }
+    // FlowPilot extension: `pce_kafka.gateway`, a type check the FlowLink schema does not have.
+    let errors = pce_kafka_errors(&doc);
+    if !errors.is_empty() {
+        return Err(invalid(errors.iter().map(|e| name_variable(e, &doc, sources))));
+    }
     apply_defaults(&mut doc);
     let mut config = decode(&doc); // decode errors are ignored, as in FlowLink
                                    // FlowLink extension: semantic checks of `unmanaged_workloads`, reported like schema errors.
@@ -261,6 +267,16 @@ pub(crate) fn validate_doc(mut doc: Value, sources: &Sources) -> Result<Config, 
     )
     .map_err(|errs| invalid(errs.iter().map(|e| name_variable(e, &doc, sources))))?;
     Ok(config)
+}
+
+/// `pce_kafka.gateway` must be a string when present (FlowPilot extension).
+fn pce_kafka_errors(doc: &Value) -> Vec<String> {
+    match doc.pointer("/pce_kafka/gateway") {
+        Some(v) if !v.is_string() => {
+            vec![format!("pce_kafka.gateway: Invalid type. Expected: string, given: {}", go_type(v))]
+        }
+        _ => Vec::new(),
+    }
 }
 
 /// The validation failure: FlowLink's header, then each error wrapped in `[...]`.
@@ -626,6 +642,7 @@ fn decode(doc: &Value) -> Config {
             installation_id: string_field(kafka, "installation_id"),
             env_override: string_field(kafka, "env_override"),
             kafka_info: string_field(kafka, "kafka_info"),
+            gateway: string_field(kafka, "gateway"),
         },
         consumers: consumers
             .map(|c| Consumer {
@@ -896,6 +913,7 @@ fn debug_dump(c: &Config) -> Vec<String> {
             installation_id: &k.installation_id,
             env_override: &k.env_override,
             kafka_info: &k.kafka_info,
+            gateway: &k.gateway,
         },
         consumers,
         proxy_config: ProxyJ {
@@ -963,6 +981,8 @@ struct KafkaJ<'a> {
     env_override: &'a str,
     #[serde(skip_serializing_if = "str::is_empty")]
     kafka_info: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    gateway: &'a str,
 }
 
 #[derive(Serialize)]
@@ -1133,6 +1153,16 @@ mod tests {
         assert_eq!(
             errors(&yaml),
             ["\t- [unmanaged_workloads.flow_window_hours: must cover at least one aggregation window (30 minutes)]"]
+        );
+    }
+
+    #[test]
+    fn gateway_key_is_read_and_type_checked() {
+        let c = validate(cfg("pce_kafka:\n  installation_id: i\n  gateway: mock:8444").as_bytes()).unwrap();
+        assert_eq!(c.pce_kafka.gateway, "mock:8444");
+        assert_eq!(
+            errors(&cfg("pce_kafka:\n  installation_id: i\n  gateway: 5")),
+            ["\t- [pce_kafka.gateway: Invalid type. Expected: string, given: integer]"]
         );
     }
 

@@ -78,7 +78,7 @@
       "default": 10000
     },
     "pce_kafka": {
-      "description": "PCE Kafka (integrations) mode; not supported by FlowPilot",
+      "description": "PCE Kafka (Integrations) mode",
       "type": "object",
       "required": ["installation_id"],
       "properties": {
@@ -208,7 +208,7 @@
                       }
                     },
                     {
-                      "description": "kafka (not supported by FlowPilot)",
+                      "description": "kafka",
                       "required": ["version", "brokers", "group", "topics"],
                       "additionalProperties": false,
                       "properties": {

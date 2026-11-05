@@ -9,6 +9,7 @@ pub mod env_config;
 pub mod flow;
 pub mod instance_id;
 pub mod install;
+pub mod kafka;
 pub mod log;
 pub mod metrics;
 pub mod parsers;

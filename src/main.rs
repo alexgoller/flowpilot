@@ -59,6 +59,7 @@ fn daemon(flags: cli::Flags) {
     start_signal_handler();
     if flags.version {
         println!("FlowPilot version: {VERSION}");
+        println!("{}", flowpilot::kafka::gateway::version_line());
         std::process::exit(0);
     }
     DEBUG.store(flags.debug, Ordering::Relaxed);

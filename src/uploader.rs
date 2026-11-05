@@ -17,6 +17,13 @@ pub const API_VERSION: u32 = 2;
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_BACKOFF_SECS: u64 = 120;
 
+/// One Kafka message per spool file (PCE Kafka mode). Ok = (partition, offset) after the broker's ack.
+pub trait MessageSink: Send + Sync {
+    fn send(&self, value: &[u8]) -> Result<(i32, i64), String>;
+    /// Flush and close at shutdown; `KafkaProducer` overrides it, test fakes keep the no-op.
+    fn close(&self, _within: std::time::Duration) {}
+}
+
 /// Connection settings for the PCE.
 #[derive(Clone, Debug)]
 pub struct PceTarget {

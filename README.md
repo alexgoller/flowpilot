@@ -14,6 +14,9 @@ FlowPilot has its own version numbers, starting at 0.9.0. Each release is compat
 ## Status
 
 - The collection and upload path is a complete reimplementation of the UDP part of FlowLink 2.0.1-2.
+- PCE Kafka (Integrations) mode and the Kafka input connector are implemented and tested against a local Kafka
+  broker, including side by side with FlowLink. They have not been run against Illumio's Integrations gateway or
+  Illumio's Kafka.
 - Unmanaged workload creation is new. It is implemented and tested against a mock PCE. It has not yet been run
   against a real PCE.
 - The crate and the binary are called `flowpilot`. The config keys are the original ones.
@@ -29,6 +32,11 @@ FlowPilot has its own version numbers, starting at 0.9.0. Each release is compat
   listed exporter addresses.
 - Aggregation per window (5 to 60 minutes), gzip-compressed protobuf upload to the PCE, with a persistent on-disk
   spool, retry with backoff, age and size limits, and five parallel senders.
+- PCE Kafka (Integrations) mode: with `pce_kafka.installation_id` set, the flow files go to Illumio's Kafka, with the
+  settings from Illumio's Integrations gateway, instead of to the PCE's REST endpoint. See
+  [docs/configuration.md](docs/configuration.md#pce_kafka).
+- Kafka input for the text parser: consumer groups, TLS with a client certificate. See
+  [docs/collectors.md](docs/collectors.md#kafka-input).
 - API key from a file or from a command, HTTP proxy settings, certificate verification switch.
 - Unmanaged workload creation: IPs inside your networks that reach a flow threshold get a workload with labels from
   CIDR rules and a reverse-DNS hostname, with per-window and per-day caps and a dry run. See
@@ -37,11 +45,8 @@ FlowPilot has its own version numbers, starting at 0.9.0. Each release is compat
 
 ## Not supported yet
 
-- Kafka connector (input) and Kafka output.
 - TCP connector.
 - AWS CloudWatch Logs connector and parser.
-- PCE Kafka / Integrations mode (`pce_kafka`). The key is validated, but a config that sets `installation_id` makes
-  the process log a message and exit.
 - IPv6 workload creation. IPv6 flows are collected and uploaded; only the automatic workloads are IPv4-only.
 - Bidirectional byte counts: like the original, only one direction's bytes per conversation are reported.
 
@@ -110,11 +115,11 @@ and start `./flowpilot`; logs go to stdout. Other command line flags: `-debug` (
 | Document | Contents |
 |---|---|
 | [docs/configuration.md](docs/configuration.md) | Every config key, default, range and validation rule; the API key formats |
-| [docs/collectors.md](docs/collectors.md) | NetFlow, IPFIX, sFlow and text parsers: ports, options, fields used, limits |
+| [docs/collectors.md](docs/collectors.md) | NetFlow, IPFIX, sFlow and text parsers, Kafka input: ports, options, fields used, limits |
 | [docs/unmanaged-workloads.md](docs/unmanaged-workloads.md) | Automatic unmanaged workload creation |
 | [docs/operations.md](docs/operations.md) | install, upgrade, rollback, uninstall, status, data directory, upload behaviour, signals, PCE permissions, troubleshooting |
 | [docs/differences-from-flowlink.md](docs/differences-from-flowlink.md) | Every intentional difference from FlowLink 2.0.1-2 |
-| [docs/testing.md](docs/testing.md) | Unit tests, clippy, the differential harness and the unmanaged scenario |
+| [docs/testing.md](docs/testing.md) | Unit tests, clippy, the differential harness, the unmanaged and Kafka scenarios |
 | [docs/compatibility.md](docs/compatibility.md) | How the decoders are checked against the specs and real exporters, results and open findings |
 | [docs/roadmap.md](docs/roadmap.md) | What is planned and what is deferred |
 
@@ -133,11 +138,13 @@ The end-to-end scripts in `tests/e2e` need Docker and are described in [docs/tes
 |---|---|
 | `src/` | The program: config, collectors (`parsers/`), aggregator, spool, uploader, `unmanaged/` |
 | `src/unmanaged/` | Unmanaged workload creation |
+| `src/kafka/` | PCE Kafka mode (gateway request, producer) and the Kafka input connector |
 | `docs/` | These documents |
 | `install.sh` | The one-line installer attached to each release |
 | `.github/workflows/` | CI and the release workflow |
 | `tests/vm/` | Lima Rocky Linux VM tests of install, upgrade, rollback and uninstall (see [docs/testing.md](docs/testing.md)) |
-| `tests/e2e/` | Docker-based differential test and the unmanaged scenario with a mock PCE |
+| `tests/e2e/` | Docker-based differential test and the unmanaged and Kafka scenarios with a mock PCE and gateway |
+| `tests/kafka/` | `broker.sh`, the local Kafka broker for the Kafka tests |
 | `tests/fixtures/` | Sample files for unit tests |
 | `tools/build-static.sh` | Static release builds (musl) |
 | `original/` | Files extracted from the FlowLink RPM by `make original`, kept locally for reference; not in the repository |

@@ -3,7 +3,9 @@
 There are six layers: unit tests that run anywhere, a differential test that compares FlowPilot with the original
 FlowLink on the same traffic, a conformance run of the decoders against captures from real exporters, scenario tests
 against a mock PCE (unmanaged workloads, and configuration from variables only), installer checks in Rocky Linux VMs,
-and a decode benchmark for the cost of the stats counters. None of them talks to a real PCE.
+and a decode benchmark for the cost of the stats counters. The Kafka features have their own tests against a local
+Kafka broker ([Kafka tests](#kafka-tests)). None of them talks to a real PCE, to Illumio's Integrations gateway or to
+Illumio's Kafka.
 
 What these checks found about decoder compatibility, and what is still open, is in
 [compatibility.md](compatibility.md).
@@ -166,6 +168,97 @@ The script checks, and prints PASS or FAIL for each:
 - the process exits with status 0 after SIGQUIT.
 
 It ends with `RESULT: PASS` or `RESULT: FAIL`.
+
+## Kafka tests
+
+PCE Kafka mode and the Kafka input connector are tested against a local Apache Kafka broker and a mock Integrations
+gateway. Nothing contacts Illumio.
+
+### Test broker
+
+```
+tests/kafka/broker.sh up [host|network]
+tests/kafka/broker.sh down [host|network]
+```
+
+Starts `apache/kafka:3.9.2` (single node, KRaft) in Docker as the container `flowpilot-kafka`. It needs Docker and
+`openssl`. Listeners:
+
+| Port | Listener |
+|---|---|
+| 9092 | plain TCP |
+| 9093 | TLS with SASL PLAIN, user `$ConnectionString` (the login of PCE Kafka mode) |
+| 9094 | TLS, client certificate required |
+
+Each `up` writes a new test CA, server and client certificates (names `localhost` and `kafka`) and a random
+connection string to `target/kafka-certs/` (`ca.pem`, `client.pem`, `client.key`, `connection_string`, ...); keys and
+the connection string are mode 0600. Topics are not created automatically; the topic `flowpilot` with 3 partitions is.
+`host` (the default) publishes the ports on `localhost`; `network` puts the broker on the Docker network
+`flowpilot-e2e` as `kafka`, for the scenarios below.
+
+### Integration tests
+
+Two test files run only when their variables name the broker; without them each test prints `skipped:` and passes,
+so a plain `cargo test` needs no broker.
+
+```
+tests/kafka/broker.sh up host
+SSL_CERT_FILE=target/kafka-certs/ca.pem FLOWPILOT_TEST_KAFKA=localhost:9092 \
+  FLOWPILOT_TEST_KAFKA_SASL=localhost:9093 FLOWPILOT_TEST_KAFKA_TLS=localhost:9094 \
+  cargo test --test kafka_producer --test kafka_group
+tests/kafka/broker.sh down
+```
+
+| Variable | Tests |
+|---|---|
+| `FLOWPILOT_TEST_KAFKA_SASL` | `tests/kafka_producer.rs`: a message over SASL and TLS returns an offset; a wrong password fails without the password in the error; certificate checking rejects the test broker's certificate; an unknown topic is refused; the client certificate loads. |
+| `FLOWPILOT_TEST_KAFKA` | `tests/kafka_group.rs`: a new group starts at the oldest offset; two members split the partitions; committed offsets resume after a restart; messages that were not handed over are delivered again; versions below 0.10.2.0 are refused. |
+| `FLOWPILOT_TEST_KAFKA_TLS` | `tests/kafka_group.rs`: consuming over TLS with the client certificate works, and without it the broker refuses. Needs `SSL_CERT_FILE=target/kafka-certs/ca.pem` so the test CA is trusted. |
+
+CI runs these in its `kafka` job, followed by the `kafka-pilot` scenario.
+
+### Scenarios
+
+```
+tests/e2e/run.sh kafka-out     # PCE Kafka mode, FlowLink vs FlowPilot (local only)
+tests/e2e/run.sh kafka-pilot   # PCE Kafka mode, FlowPilot alone (also in CI)
+tests/e2e/run.sh kafka-in      # Kafka input, FlowLink vs FlowPilot (local only)
+```
+
+Each starts the test broker in `network` mode, creates the topics with 3 partitions, runs the programs in a
+`rust:1-bookworm` container on `flowpilot-e2e`, and removes the broker and the network at the end. Artifacts go to
+`target/e2e-kafka-out`, `target/e2e-kafka-pilot` and `target/e2e-kafka-in`. They end with `ALL CHECKS PASSED` or
+`SOME CHECKS FAILED`.
+
+- **`kafka-out`** needs the original binary, the flow generator, and a local file `re/e2e/flowlink_gateway_host`
+  that holds FlowLink's built-in gateway host name (not in the repository; without it, or without the original, the
+  scenario prints `SKIPPED` and exits 0). FlowLink reaches a mock gateway (`tests/e2e/mock_gateway.py`, HTTPS)
+  because that name is mapped to the container itself; FlowPilot is pointed at its own mock with `pce_kafka.gateway`.
+  The name is never printed, and FlowLink's log is cleaned of it on every way out. Both get the same traffic
+  and write to their own topic over SASL and TLS (`verify_pce_cert: false`, since the test certificate is
+  self-signed). After SIGQUIT the topics are read back and decoded. It checks the exit statuses, the message keys
+  (`1+<time>Z`), the gateway requests (path, `pceHost`, `orgId`, basic authentication), the log lines, that neither
+  the log nor a second `-debug` run contains the connection string, the header fields, the exporter address, the
+  absence of the directional byte counters, and then `RECORDS IDENTICAL`.
+- **`kafka-pilot`** needs neither the original nor the flow generator. The mock gateway answers 404 and the settings
+  come from a `kafka_info` file (mode 0600). It waits for one 5-minute window, about 6 minutes in all, and checks that
+  the records in the topic equal `uploads.records_uploaded`, the header fields, the keys, the gateway request, the
+  log lines (`Response Code 404`, `KafkaProducer setup`, `kafkaSync: true`), `/metrics` showing
+  `flowpilot_upload_transport_info{transport="kafka"} 1`, and that neither the log nor `/metrics` contains the
+  connection string.
+- **`kafka-in`** needs the original binary (otherwise `SKIPPED`, exit 0). FlowLink and FlowPilot run in REST mode
+  against their own mock PCE, each with two text consumers: one on plain TCP (9092) and one over TLS with the client
+  certificate (9094), in their own consumer groups. The test CA is added to the container's trust store. 48 syslog
+  lines are produced to both topics before the start and 10 after both have connected. It checks the exit statuses,
+  the `Client: Illumio-flowlink connected to kafka brokers:` lines, that no log holds the client key, the flow count
+  sums and `RECORDS IDENTICAL`.
+
+Last run 2026-11-06: `kafka-out` RECORDS IDENTICAL (308 records), `kafka-pilot` ALL CHECKS PASSED (48 records),
+`kafka-in` RECORDS IDENTICAL (58 records); integration tests 5 and 6 passed.
+
+What these do not prove: that Illumio's gateway and Kafka accept FlowPilot. That needs a run with a
+real installation id, which has not been done. The `kafka-in` producer writes to one partition only, so reading
+several partitions in one connector is covered by the integration tests, not by the differential.
 
 ## Installer on a real host (Lima VMs)
 

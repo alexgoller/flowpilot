@@ -1,13 +1,14 @@
 # Collectors
 
-A collector is a consumer in `consumers`: a parser plus one or more UDP connectors. This page describes what each
-parser reads and what it cannot do. For the config keys see [configuration.md](configuration.md).
+A collector is a consumer in `consumers`: a parser plus one or more connectors, UDP or, for the text parser, Kafka.
+This page describes what each parser reads and what it cannot do. For the config keys see
+[configuration.md](configuration.md).
 
 ## Common behaviour
 
-- **Transport.** UDP only. Each configured port is bound dual-stack (IPv6 wildcard that also accepts IPv4), with a
-  256000-byte receive buffer request. The kernel limits that to `net.core.rmem_max`; if exporters send in bursts and
-  you see drops, raise the sysctl.
+- **Transport.** UDP, and Kafka for the text parser ([Kafka input](#kafka-input)). Each configured UDP port is bound
+  dual-stack (IPv6 wildcard that also accepts IPv4), with a 256000-byte receive buffer request. The kernel limits
+  that to `net.core.rmem_max`; if exporters send in bursts and you see drops, raise the sysctl.
 - **Threads.** Each port gets twice as many reader threads and parser threads as the host has CPUs. Readers block when
   the parser queue is full, so overload shows up as dropped datagrams in the kernel, not as memory growth.
 - **Sender address.** The address a datagram arrives from identifies the exporter. For NetFlow v9 and IPFIX it is part
@@ -152,12 +153,35 @@ Limits:
 |---|---|
 | Parser type | `text` |
 | Default port | 6514/udp |
-| Connector options | `ports`, `remote_addrs` |
+| Connector options | `ports`, `remote_addrs` (UDP); see [Kafka input](#kafka-input) |
 | Parser options | see [configuration.md](configuration.md#text-parser-properties) |
 
 Each datagram is plain ASCII text with one or more lines (a datagram with any byte above 0x7F is dropped, with one log
 line per parser thread). A line that ends the datagram without a newline is processed too. Every non-empty line is one
 flow with a count of 1.
+
+### Kafka input
+
+The text parser can also read from Kafka topics: a connector of type `kafka`
+([properties](configuration.md#kafka-connector-properties)). Each connector entry starts `instances` consumers (by
+default one per broker entry), all members of the consumer group `group`, which share the topics' partitions.
+
+- One message is one datagram, handled exactly as a UDP datagram of the text parser: one or more lines, ASCII only.
+  A message is passed whole, whatever its size.
+- The exporter address of every message is the first entry of `brokers`, as written (for example `kafka1:9092`).
+  It shows in the stats as the exporter, and in `restart_info.yml` with the transport `kafka`.
+- A new group starts at the oldest message of each partition; an existing group resumes after its committed offset.
+  A message's offset is committed only after the parser has it, about once a second, so after a crash or a
+  rebalance some messages can arrive twice (at least once).
+- The parser's own meter counts lines as usual; a shared `meter kafka` block counts the messages of all Kafka
+  connectors.
+- If the brokers cannot be reached, the error is logged and the consumer tries again every 60 seconds. After 20
+  minutes without success the process exits 1.
+- `remote_addrs` does not apply.
+
+Only the text parser takes a Kafka connector. The Kafka input was tested against Apache Kafka 3.9, over plain TCP and
+over TLS with a client certificate. It was not tried against Azure Event Hubs; in a library check, the consumer
+library failed against Microsoft's Event Hubs emulator after logging in.
 
 ### How a line is read
 
@@ -238,6 +262,7 @@ exits 1. An invalid `timestamp_format` also exits.
 
 ## What is not collected
 
-- NetFlow/IPFIX over TCP, Kafka-delivered flows and AWS flow logs (not yet supported).
+- NetFlow/IPFIX over TCP and AWS flow logs (not yet supported).
+- NetFlow, IPFIX or sFlow from Kafka: only the text parser takes a Kafka connector, as in FlowLink.
 - Packet and byte counters from sFlow.
 - Anything the exporter does not put on the wire; FlowPilot does not enrich or resolve addresses.

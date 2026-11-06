@@ -169,7 +169,7 @@ the start.
 
 | Field | Unit | Meaning |
 |---|---|---|
-| `address` | | Source IP of the datagrams. IPv6 addresses are written without brackets, for example `2001:db8::1`. |
+| `address` | | Source IP of the datagrams. IPv6 addresses are written without brackets, for example `2001:db8::1`. For a Kafka input connector it is the first entry of `brokers` as configured, for example `kafka1:9092`. |
 | `protocols` | | Protocols and versions seen, in the order first seen: `netflow_v5`, `netflow_v7`, `netflow_v9`, `ipfix`, `sflow`, `text`. |
 | `datagrams` | count | Datagrams from this exporter. |
 | `flows` | count | Flow records decoded from them (as `flows_decoded`). |
@@ -194,8 +194,8 @@ the start.
 | Field | Unit | Meaning |
 |---|---|---|
 | `transport` | | Where flow files are sent: `"pce"` (REST upload) or `"kafka"` (PCE Kafka mode). In Kafka mode, "accepted" below means the broker's ack. |
-| `succeeded` | count | Files the PCE accepted. |
-| `failed` | count by kind | Failed attempts, by HTTP status (`"503"`) or `"error"` when there was no response. Each retry counts. In Kafka mode every failure is `"error"`. |
+| `succeeded` | count | Files the PCE accepted, or in Kafka mode the broker acknowledged. |
+| `failed` | count by kind | Failed attempts, by HTTP status (`"503"`) or `"error"` when there was no response. Each retry counts. In Kafka mode there is no status, so every failure is `"error"`. |
 | `records_uploaded` | count | Records in the accepted files. Files left over from an earlier run count 0, because their record count is not known. |
 | `last_success_at` | time | Last accepted upload. |
 | `last_error` | | Status line or transport error of the last failure. Credentials in a URL are replaced by `***`, and headers are never included. A Kafka error shows the connection string as `********`. |

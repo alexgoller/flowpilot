@@ -170,7 +170,8 @@ executable and its files readable under `ProtectSystem=strict`.
 
 ### Firewall
 
-The collector only receives UDP. Open the ports you configured to the exporters. On a host with firewalld, for
+The collector only receives UDP (a Kafka input connector connects out to its brokers instead). Open the ports you
+configured to the exporters. On a host with firewalld, for
 example for NetFlow on 2055 from one exporter:
 
 ```
@@ -180,6 +181,11 @@ firewall-cmd --reload
 
 FlowPilot does not change firewall settings. Outbound, it needs HTTPS to the PCE (and to the proxy, if you use one),
 and DNS if `unmanaged_workloads.dns` uses the system resolver.
+
+In [PCE Kafka mode](#pce-kafka-mode) it also needs, outbound, HTTPS (443, or the port in `pce_kafka.gateway`) to
+Illumio's Integrations gateway, through the proxy if one is set, and TCP to every broker in `bootstrapServers` on the
+port given there. The broker connections never go through the proxy. A Kafka input connector needs TCP to its
+`brokers`.
 
 ### Time and certificates
 
@@ -218,6 +224,20 @@ Lines to know:
 | `Got signal`, `Writing flows` | Shutdown, see [Signals](#signals-and-shutdown). |
 | `FLOWPILOT_STATS {...}` | The stats, as one JSON object, every `stats.interval_seconds`. See [stats.md](stats.md). |
 | `Error: stats HTTP endpoint <addr>: <error>` | The stats endpoint could not bind its address; FlowPilot exits 1. |
+
+PCE Kafka mode and the Kafka input connector add these:
+
+| Line | Meaning |
+|---|---|
+| `Getting integrations kafka config` | Start-up in PCE Kafka mode: asking the Integrations gateway for the Kafka settings. |
+| `Response Code <status>` | The gateway's answer: 200 (settings from the gateway) or 404 (settings from `kafka_info`). |
+| `KafkaProducer setup` | Connected to the brokers and found the topic. |
+| `Sending file: <path> kafkaSync: true` | A message send attempt. |
+| `Sent kafka message to partition: <p> offset: <o>` | The broker acknowledged the message; the file is deleted. |
+| `Failed to send kafka message: <error>` | The send failed; the file is retried after the backoff. |
+| `Client: <id> connected to kafka brokers: <brokers>` | A Kafka input consumer connected. One line per instance. |
+| `Client error: <error>` | A Kafka input consumer lost its connection or group; it reconnects. |
+| `kafka exiting` | A Kafka input consumer stopped at shutdown. |
 
 ### Metrics lines
 
@@ -272,6 +292,21 @@ At the end of each window FlowPilot merges the flows it collected and writes the
   the setting. The first upload happens after one full window.
 - **Instance id.** Every upload carries the content of `.uuid`.
 
+**PCE Kafka mode.** With `pce_kafka.installation_id` set, the spool files have the same name, compression and
+protobuf message, with these differences, as with FlowLink:
+
+- The header also carries `org_id`, `installation_id` and the PCE host (`pce_addr` with its port).
+- Each record carries the total byte count (incoming plus outgoing, when not zero) instead of the two directional
+  counters, the exporter's address (4 or 16 bytes; absent when the exporter is not an IP address, such as a Kafka
+  broker name), and the source and destination MAC addresses and prefix lengths when the exporter sent them.
+- Records from different exporters are not merged, because the exporter is part of the record.
+- At most `maxObjectsPerMessage` records (from the gateway) go in one file, in place of `max_flows_per_post`. With 0
+  or less, a window is one file.
+
+Each spool file is sent as one Kafka message. Its value is the file, unchanged (no Kafka compression, no headers).
+Its key is `<org_id>+<local time>Z`, for example `1+2026-11-05T15:03:07Z`: the local time when the message is sent,
+with a literal `Z`. The partition follows from a hash of the key.
+
 ## Upload behaviour
 
 - **Endpoint.** `POST https://<pce_addr>/api/v2/orgs/<org_id>/traffic_data/flowlink`. If the PCE answers 404 for
@@ -294,6 +329,33 @@ At the end of each window FlowPilot merges the flows it collected and writes the
   oldest flow data is the first to go.
 - **Unmanaged workload calls** are separate from this. They use their own REST requests and never block uploads.
 
+### PCE Kafka mode
+
+With `pce_kafka.installation_id` set, the files go to Illumio's Kafka instead of the PCE's REST endpoint. The start-up
+request to the Integrations gateway and the settings it returns are described in
+[configuration.md](configuration.md#pce_kafka).
+
+- **Connection.** TLS to the brokers in `bootstrapServers`, with SASL PLAIN: user `$ConnectionString`, password the
+  `connectionString`. The brokers' certificates are checked against the system trust store unless
+  `verify_pce_cert: false`. No proxy is used for the brokers.
+- **Synchronous.** A sender waits until the broker has acknowledged the message (from all in-sync replicas), and only
+  then deletes the file. An acknowledgement may take up to 30 seconds.
+- **Retry.** Any error (connection, login, a timeout, a message over 1 000 000 bytes) logs
+  `Failed to send kafka message:` and the same backoff as for the PCE follows: 10 seconds, then 20, up to 120, until
+  the file's retention ends. The PCE's status rules do not apply.
+- **Senders.** Five senders, one second's pause after each file, as for the PCE.
+- **REST upload of flows is off.** Nothing is posted to `/traffic_data`. The [unmanaged workload](unmanaged-workloads.md)
+  feature still uses the PCE REST API with the same `pce_addr` and key, so the PCE must stay reachable for it.
+- **Shutdown.** The last window is written as usual. With `maxObjectsPerMessage` 0 or absent it is not sent before
+  exit; it stays in the spool for the next start, as with FlowLink. The producer is closed last.
+
+**What was tested.** PCE Kafka mode was tested against an Apache Kafka 3.9 broker with SASL PLAIN over TLS and a mock
+gateway, and compared with FlowLink on the same traffic (see [testing.md](testing.md#kafka-tests)). It has not been
+run against Illumio's Integrations gateway or Illumio's Kafka. The login (SASL PLAIN as `$ConnectionString`) follows
+the Azure Event Hubs convention. The Kafka library FlowPilot uses for sending worked against Microsoft's Event Hubs
+emulator; the emulator offers no TLS, so that check ran without it. TLS against real Event Hubs is not verified until
+the first run against Illumio's Kafka.
+
 ### PCE API key permissions
 
 For flow upload, the API key must be accepted by the PCE for the traffic data endpoint above. The PCE role this needs
@@ -313,13 +375,15 @@ Set `proxy_config` (`flowpilot install --proxy URL` writes its `https_proxy`) or
 
 `SIGINT`, `SIGTERM` and `SIGQUIT` all do the same. Only the first one counts; later ones are ignored.
 
-1. `Got signal`. The sockets stop reading (`udp exiting` per reader), and the metrics are removed.
+1. `Got signal`. The sockets stop reading (`udp exiting` per reader), and the metrics are removed. Kafka input
+   consumers stop within a second, hand over what they hold, commit their offsets, leave their group and log
+   `kafka exiting`.
 2. A 5-second pause lets the parsers finish what they hold (`Allowing parsers to drain`).
 3. `Writing flows`: the window in progress is flushed. If nothing else is queued and everything fits one file, that
    file is sent before exit and FlowPilot waits for the senders for up to about 32 seconds
    (`Waiting for file senders to drain`). Otherwise the files stay in the data directory and are sent at the next start.
 4. The unmanaged workload worker gets the last window to count (nothing is created at shutdown) and up to 5 seconds
-   to save its state.
+   to save its state. In PCE Kafka mode the Kafka producer is then closed.
 5. The process exits with status **0**, so systemd does not count a stop as a failure. FlowLink exits 1 here.
 
 Nothing is lost on a stop: unsent files stay on disk. A `kill -9` loses the flows of the current window that were
@@ -382,6 +446,14 @@ Start by reading the log from the start of the run: `journalctl -u flowpilot --s
 | `traffic_flows_*` files pile up | The PCE rejects or cannot be reached; see the lines above. They are deleted by age and by the size cap. |
 | Old flows seem to vanish | The retention or size cap evicted them. Check `file_retention_hours` (also stay at or below 546) and `data_directory_size_mb`. |
 | `Unmanaged workloads: ... errors` | See [unmanaged-workloads.md](unmanaged-workloads.md#log-lines). |
+| `this build has no built-in Integrations gateway; set pce_kafka.gateway` | PCE Kafka mode on a build without a built-in gateway (`-version` says `Built-in Integrations gateway: no`), or `env_override` on a build without a staging domain. Use a release binary or set `pce_kafka.gateway`. |
+| `Error sending Integrations kafka config request:` | The gateway cannot be reached: DNS, firewall to port 443, proxy, or its certificate. |
+| `No valid Integrations kafka config` | The gateway answered 404 (no Kafka settings for this PCE host and org) and `kafka_info` is not set. Check `pce_addr` and `org_id`, or ask for the settings and put them in a `kafka_info` file. |
+| `Invalid Integrations kafka config response: <body>` | The gateway answered with a status other than 200 or 404, for example 401 for an API key it does not accept. |
+| `Unable to create Kafka Producer: <error>` | The brokers cannot be reached (firewall to the broker port; the proxy is not used), the TLS check failed (`verify_pce_cert`), the connection string was refused, or the topic does not exist. The process exits 1 and systemd restarts it. |
+| `Failed to send kafka message: <error>` repeating | The brokers are unreachable or refuse the messages. Files stay in the spool and are retried until retention. |
+| `Unable to connect to kafka brokers: <brokers> for 20 minutes. Exiting.` | A Kafka input connector could not connect for 20 minutes; the process exits 1. The errors logged every 60 seconds before it say why: address, firewall, TLS trust of the broker CA, or a client certificate the broker refuses. |
+| `Client error:` repeating | A Kafka input consumer keeps losing its connection or its group. Check the broker logs and the group. |
 
 ## Cutting a release
 
@@ -397,7 +469,9 @@ Start by reading the log from the start of the run: `journalctl -u flowpilot --s
    `flowpilot-<version>-x86_64-linux`, `flowpilot-<version>-aarch64-linux`, `SHA256SUMS`, `install.sh`, `LICENSE`,
    `NOTICE` and `THIRD_PARTY_LICENSES.md` (the licences of the bundled crates, generated by `cargo about` from
    `about.toml` and `about.hbs`). Only that last job has write permission. CI runs the same `cargo about` step on every
-   push, so a dependency with a licence not listed in `about.toml` fails there first.
+   push, so a dependency with a licence not listed in `about.toml` fails there first. The accepted licences are
+   Apache-2.0, MIT, BSD-3-Clause, ISC, Unicode-3.0, MIT-0 and CDLA-Permissive-2.0; the last one is for
+   `webpki-roots`, which the Kafka consumer library depends on.
 
 Users install with the one-liner, which verifies the checksum before running `flowpilot install`:
 

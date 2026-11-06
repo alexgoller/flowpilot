@@ -1,7 +1,7 @@
 # Configuration reference
 
 The config is one YAML file. Its path comes from the environment variable `CONFIG_FILE`; there is no command line
-option for it. The keys are those of FlowLink 2.0.1-2, plus the new top-level keys `unmanaged_workloads` and `stats`. All settings can also be given as
+option for it. The keys are those of FlowLink 2.0.1-2, plus the new top-level keys `unmanaged_workloads` and `stats` and the new key `pce_kafka.gateway`. All settings can also be given as
 [environment variables](#environment-variables).
 
 `flowpilot install` writes `/etc/flowpilot/config.yaml` and the key file `/etc/flowpilot/api_key` for you, from the
@@ -289,7 +289,7 @@ Required keys: `pce_addr`, `api_key`, `data_directory`, `consumers`.
 | `metrics_print_seconds` | integer | `60` | at least 15 | How often per-consumer rates are logged. Above 32767 it reads as 0 and nothing is logged. |
 | `max_flows_per_post` | integer | `10000` | 2500 to 20000 | Most flow records in one upload file. A larger window is split into several files. |
 | `proxy_config` | object | none | | HTTP proxy settings. |
-| `pce_kafka` | object | none | | PCE Kafka (Integrations) mode. Not supported in this build. |
+| `pce_kafka` | object | none | | PCE Kafka (Integrations) mode: flows go to Illumio's Kafka instead of the PCE. See [pce_kafka](#pce_kafka). |
 | `consumers` | list | required | at least 1 entry | Parsers and their connectors. |
 | `unmanaged_workloads` | object | see below | | Automatic unmanaged workload creation. New in FlowPilot. |
 
@@ -334,13 +334,73 @@ unmanaged workload API calls.
 
 ```yaml
 pce_kafka:
-  installation_id: "..."      # required inside this object
-  env_override: dev           # optional: dev or stage
-  kafka_info: "..."           # optional string
+  installation_id: "..."                    # required inside this object; not empty turns the mode on
+  env_override: stage                       # optional: dev or stage
+  kafka_info: /etc/flowpilot/kafka_info     # optional: a file, or "$command", with the Kafka settings
+  gateway: integrations.example.com         # optional, FlowPilot only: the Integrations gateway host
 ```
 
-The object is validated, but the mode is not implemented. If `installation_id` is not empty, FlowPilot logs
-`PCE Kafka (Integrations) mode is not supported in this build` and exits 1. Leave the key out.
+With a non-empty `installation_id`, FlowPilot runs in PCE Kafka (Integrations) mode, as FlowLink does: each upload
+file goes as one message to a Kafka topic that Illumio runs for the PCE, instead of to the PCE's REST endpoint. What
+is sent and how is in [operations.md](operations.md#pce-kafka-mode). An empty `installation_id` is the normal REST
+mode.
+
+| Key | Type | Meaning |
+|---|---|---|
+| `installation_id` | string | Required in the object. Put in the header of every message. |
+| `env_override` | string | `dev` or `stage`: use that environment of the Integrations gateway instead of production (see below). |
+| `kafka_info` | string | Where to find the Kafka settings when the gateway has none for this PCE (status 404). A file path or a `$command`, read like [`api_key`](#api_key). It holds the same JSON as the gateway's answer. |
+| `gateway` | string | The Integrations gateway host, optionally with `:port`. New in FlowPilot; FlowLink ignores the key. It wins over the built-in gateway and over `env_override`. |
+
+**Start-up.** After the API key and the instance id are read, and before the stats endpoint and the collectors start,
+FlowPilot logs `Getting integrations kafka config` and asks Illumio's Integrations gateway for the Kafka settings:
+
+- `GET https://<gateway>/integrations/api/v1/config/flowlink-kafka?pceHost=<host>&orgId=<org_id>`. `<host>` is
+  `pce_addr` up to its first `:`, without the port. Nothing is URL-encoded.
+- HTTP basic authentication with the PCE API user and secret, `Accept: application/json`, timeout 60 seconds.
+- The proxy settings apply ([proxy_config](#proxy_config), `HTTPS_PROXY`, `NO_PROXY`), as for the PCE.
+- The gateway's certificate is checked against the system trust store unless `verify_pce_cert: false`.
+- `Response Code <status>` is logged.
+
+**Which gateway.** `gateway` when it is set. Otherwise the gateway built into release binaries, or, with
+`env_override`, `<env_override>-<staging domain>` with the staging domain built into the binary. These names are
+given at build time through the variables `FLOWPILOT_BUILD_GATEWAY` and `FLOWPILOT_BUILD_GATEWAY_STAGING_DOMAIN`; they
+are not in the source. `flowpilot -version` prints `Built-in Integrations gateway: yes` or `no`, without the name. A
+build without a built-in gateway (a plain `cargo build`, for example), with no `gateway` set, logs
+`this build has no built-in Integrations gateway; set pce_kafka.gateway` and exits 1. The same happens with
+`env_override` on a build without a staging domain.
+
+**The answer.**
+
+- Status 200: the body is the Kafka settings.
+- Status 404: the settings come from `kafka_info`. If `kafka_info` is empty, `No valid Integrations kafka config` is
+  logged and the process exits 1.
+- Any other status: `Invalid Integrations kafka config response: <body>` and exit 1.
+
+The settings are a JSON object:
+
+```json
+{"bootstrapServers": "broker1:9093,broker2:9093", "topic": "...", "connectionString": "...", "maxObjectsPerMessage": 5000}
+```
+
+- Keys are matched without regard to case, as Go does. Unknown keys are ignored, `null` leaves a value unset, and
+  when a key appears twice the last one wins.
+- `bootstrapServers`: comma-separated `host:port` list of brokers. If it is empty, `No Integrations kafka Servers
+  configured` and exit 1.
+- `topic`: the topic to write to.
+- `connectionString`: the SASL password. It is never logged.
+- `maxObjectsPerMessage`: an integer. It replaces `max_flows_per_post` without the 2500 to 20000 check, as in
+  FlowLink. 0, absent or negative means one message per window, with no limit on the records in it.
+
+Invalid JSON gives `Unable to process Integrations Kafka config: <error>` (status 200) or
+`Unable to process Integrations kafka config: <404 body>` followed by the error (from `kafka_info`), and exit 1. The
+error text says where the JSON is wrong, never what the values are.
+
+**Connecting.** FlowPilot then connects to the brokers (see [operations.md](operations.md#pce-kafka-mode)) and logs
+`KafkaProducer setup`. If the brokers cannot be reached, the login fails or the topic does not exist, it logs
+`Unable to create Kafka Producer: <error>` and exits 1, with no retry; systemd restarts the service.
+
+There is no `FLOWPILOT_*` variable for these keys yet.
 
 ### consumers
 
@@ -352,7 +412,7 @@ Each entry is one data source: a parser, and the connectors that feed it. Requir
 | `name` | string | Label for logs and for the metrics lines. Entries with the same name share one meter. |
 | `parser.type` | string | `netflow`, `ipfix`, `sflow` or `text`. `aws` passes validation but is not supported. |
 | `parser.properties` | object | Parser options. Only the `text` parser has any. |
-| `connectors[].type` | string | `udp`. `tcp`, `kafka` and `aws` pass validation, but the connector is rejected at start-up with `Unsupported connector: <type>`. |
+| `connectors[].type` | string | `udp`, or `kafka` with the `text` parser. `tcp` and `aws` pass validation, but the connector is rejected at start-up with `Unsupported connector: <type>`. A `kafka` connector on another parser logs `Parser <type> does not support connector kafka`. |
 | `connectors[].properties` | object | Connector options, see below. |
 
 A consumer that cannot start any of its connectors is skipped. If no consumer starts, the process exits 1 without a
@@ -374,8 +434,61 @@ property is logged (`Unsupported udp connector property: <key>`) and ignored. An
 connector from starting. If several ports are listed and one fails to bind, the earlier ports keep running and the
 connector counts as failed.
 
-The kafka and aws property sets are accepted by the schema but unused (see
-[roadmap.md](roadmap.md#deferred-connectors)).
+The aws property set is accepted by the schema but unused (see [roadmap.md](roadmap.md#deferred-connectors)).
+
+#### Kafka connector properties
+
+Only with `parser.type: text`. The connector joins a Kafka consumer group and hands each message to the parser as
+one datagram; see [collectors.md](collectors.md#kafka-input). Kafka connectors can only be set in the config file,
+not through variables.
+
+```yaml
+  - name: firewall-kafka
+    parser:
+      type: text
+      properties: { src_ip: src, dst_ip: dst, dst_port: dport, protocol: proto }
+    connectors:
+      - type: kafka
+        properties:
+          brokers: "kafka1:9094,kafka2:9094"
+          version: "2.8.1"
+          group: flowpilot
+          topics: firewall-logs
+          broker_certs: /etc/flowpilot/kafka-client.pem
+          broker_keys: /etc/flowpilot/kafka-client.key
+```
+
+| Key | Type | Default | Meaning |
+|---|---|---|---|
+| `brokers` | string | required | Comma-separated `host:port` list. Spaces around entries are ignored. The first entry, as written, is the exporter address of every message. |
+| `version` | string | required | The brokers' Kafka version. Format: `a.b.c`, or `0.a.b.c` when it starts with `0`; digits only, at least 5 characters. Any such version is accepted. Below `0.10.2.0` consumer groups are refused (see below). |
+| `group` | string | required | The consumer group. A new group starts at the oldest message of each partition. |
+| `topics` | string | required | Comma-separated topics. Spaces around entries are ignored. |
+| `instances` | integer | the number of `brokers` entries | Consumers started for this connector, each a member of the group. 0 means the default. |
+| `client_id` | string | `Illumio-flowlink` | Client id sent to the brokers. With more than one instance, each gets the suffix `-<n>`, starting at `-0`. |
+| `broker_certs` | string | none | A file, or a `$command`, giving the client certificate in PEM. Setting it turns on TLS. |
+| `broker_keys` | string | none | A file, or a `$command`, giving the matching private key in PEM. Required with `broker_certs`. |
+
+Without `broker_certs` the connection is plain TCP. With it, the connection uses TLS, the brokers' certificates are
+checked against the system trust store with a host name check (`verify_pce_cert` does not apply here), and the client
+certificate is offered. To trust a private broker CA, add it to the system trust store (`update-ca-trust` on RHEL) or
+point `SSL_CERT_FILE` at a bundle that contains it. There is no SASL for the input connector.
+
+The PEM text is cut into blocks at each `-----BEGIN`. The certificate and key blocks are paired in order. The first
+pair is the one offered; any others must load too but are not used. If neither holds a PEM block, TLS is used
+without a client certificate. PEM content is never logged.
+
+Errors:
+
+| Log line | Effect |
+|---|---|
+| `Missing kafka property: <key>` | The connector does not start. |
+| ``Error: invalid version `<version>` `` | The connector does not start. With `-debug` the process exits. |
+| `Invalid kafka instances value: <n>` | A negative `instances`; the connector does not start. |
+| `Missing script for broker certificate keys.` | `broker_certs` without `broker_keys`; exit 1. |
+| `Number of broker certs doesn't match number of broker keys.` | Exit 1. |
+| `Error: <error>` | A certificate or key does not load, or a key does not match its certificate; exit 1. |
+| `kafka: invalid configuration (consumer groups require Version to be >= V0_10_2_0)` | `version` is below 0.10.2.0. Handled like a connection error: retried every 60 seconds, exit 1 after 20 minutes. |
 
 #### Text parser properties
 

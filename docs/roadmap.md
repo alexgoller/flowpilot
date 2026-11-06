@@ -8,6 +8,8 @@ below were taken on 2026-10-22.
 - Done: the standalone install (static binaries, `flowpilot install`, release workflow); the UDP collection and upload path (NetFlow, IPFIX, sFlow, text), the spool and uploader, and automatic
   unmanaged workload creation, tested against a mock PCE. Its flow counts are kept in hourly buckets, about one entry
   per unknown internal IP per hour of the window.
+- Done (2026-11): PCE Kafka (Integrations) mode and the Kafka input connector, tested against a local Kafka broker
+  and compared with FlowLink. See [Kafka](#kafka).
 - Open: a run of unmanaged workload creation against a real PCE.
 - Open: some verification from the original plan: unit tests with captured exporter traffic, a config accept/reject
   comparison against the original on edge cases, and a check that every feature of the original has a counterpart.
@@ -53,6 +55,22 @@ Done as part of `flowpilot install` (see above).
 The unmanaged workload feature is IPv4-only: IPv6 CIDRs are refused and IPv6 addresses never become candidates.
 IPv6 flows are collected and uploaded as usual. Support for IPv6 workloads is wanted later, but not now.
 
+## Kafka
+
+Done: PCE Kafka (Integrations) mode (the gateway request, the Kafka record format, sending each file as one message)
+and the Kafka input connector for the text parser. The differences from FlowLink are listed in
+[differences-from-flowlink.md](differences-from-flowlink.md#pce-kafka-mode).
+
+Later:
+
+- **A first run against Illumio.** Only with the owner's go-ahead, with a real installation id read at run time from
+  a file outside the repository. Until then, the gateway request and TLS against Illumio's Kafka (Azure Event Hubs
+  conventions) are not verified.
+- **Installer flags** for `pce_kafka.installation_id` and `kafka_info`. Not done in this round, because they touch
+  every part of the installer; edit the config by hand for now.
+- **Kafka over a proxy.** Neither FlowLink nor FlowPilot sends Kafka traffic through the HTTP proxy; only the gateway
+  request uses it.
+
 ## Deferred connectors
 
 These parts of FlowLink 2.0.1-2 were not reimplemented. The config schema still accepts them, and a config that uses
@@ -60,9 +78,7 @@ them fails to start the affected consumer with a clear message.
 
 | Feature | Notes |
 |---|---|
-| Kafka connector (input) and Kafka output | Later. The output branch also changes the record format. |
 | AWS CloudWatch Logs connector and parser | Later. |
 | TCP connector | Much later. The text parser already has a partial-line path for it. |
-| PCE Kafka / Integrations mode (`pce_kafka`) | Later. |
 
 If you depend on one of these, keep running FlowLink for that data source for now.

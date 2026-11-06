@@ -25,6 +25,10 @@ output stays comparable ([Preserved on purpose](#preserved-on-purpose)) or delib
   behaviour is that of the original.
 - **`-print-config`**, a new command line flag: prints the effective configuration with the origin of each value and
   exits. See [configuration.md](configuration.md#seeing-the-effective-configuration).
+- **`pce_kafka.gateway`** sets the Integrations gateway host for PCE Kafka mode, in place of the one built into the
+  binary. FlowLink's schema allows the key and FlowLink ignores it. See [configuration.md](configuration.md#pce_kafka).
+- **`-version`** prints a second line, `Built-in Integrations gateway: yes` or `no`: whether this build can reach
+  the gateway without `pce_kafka.gateway`. The name itself is never printed.
 
 ## Not implemented
 
@@ -33,11 +37,8 @@ accepts them.
 
 | Feature | What FlowPilot does |
 |---|---|
-| Kafka connector (input) | The connector is rejected with `Unsupported connector: kafka`; the consumer does not start. |
 | TCP connector | Same, `Unsupported connector: tcp`. The original starts it. |
 | AWS CloudWatch Logs connector and `aws` parser | `Unsupported connector: aws` or `aws parser not supported.` |
-| Kafka output | Not available; uploads always go to the PCE REST endpoint. |
-| PCE Kafka / Integrations mode (`pce_kafka`) | If `installation_id` is set, FlowPilot logs `PCE Kafka (Integrations) mode is not supported in this build` and exits 1. |
 | Wrapper scripts and init script | The RPM of the original ships control and monitor scripts and a SysV script. FlowPilot is the bare program; run it with systemd ([operations.md](operations.md)). |
 
 A consumer with several connectors keeps the ones that start. If no consumer starts at all, the process exits 1
@@ -67,6 +68,50 @@ silently, as the original does.
 - **Version text.** `-version` prints `FlowPilot version: 0.9.0`; the original printed `FlowLink version:`.
 - **Shutdown of idle sockets.** UDP readers check for shutdown once a second. The original only noticed after the next
   datagram arrived.
+
+### PCE Kafka mode
+
+- **Broker certificates are verified.** FlowLink never checks the Kafka brokers' certificates. FlowPilot checks them
+  against the system trust store, with a host name check, unless `verify_pce_cert: false`.
+- **Producer settings fixed by the Kafka library.** Every message waits for all in-sync replicas (FlowLink: the
+  leader only), which is safer and slightly slower. The broker gets 30 seconds to acknowledge (FlowLink: 10). A failed
+  request is retried about five times, 100 ms apart, within a deadline instead of by count. Connecting and reading the
+  topic metadata each have a 30-second limit, and one send about 30.5 seconds. The 1 000 000-byte message limit is
+  checked by FlowPilot before sending: `message of <n> bytes is larger than 1000000 bytes`.
+- **SASL request versions.** The versions of the SASL handshake and authenticate requests come from the Kafka library
+  and can differ from FlowLink's. The test broker accepts them; Illumio's brokers have not been tried.
+- **Lists are trimmed.** Spaces around the entries of `bootstrapServers` are ignored and empty entries dropped. The
+  same holds for `brokers` and `topics` of the Kafka input connector.
+- **Error texts.** The texts after `Unable to create Kafka Producer:` and `Failed to send kafka message:` come from a
+  different Kafka client and differ. Errors in the Integrations JSON are FlowPilot's own wording, close to Go's.
+- **`Unable to process Integrations Kafka config:`** (status 200) is followed by the parse error, not the response
+  body. FlowLink prints the body as a list of byte values, which contains the connection string.
+
+### Kafka input connector
+
+- **Joining the group.** The consumer joins its group at the first poll, not while connecting. A failed join is
+  logged after the `Client: ... connected to kafka brokers:` line as `Client error: <error>`, and the consumer
+  reconnects. A join that fails with a retriable error is retried by the library without FlowLink's limit of four
+  tries two seconds apart.
+- **Rebalance timeout.** A consumer that does not poll for 60 seconds, for example because the parser queue stays
+  full, leaves the group; its partitions go to the other members. Messages it had not yet handed to the parser are
+  delivered again (at least once). FlowLink's client has no such limit.
+- **Offset commits.** Offsets are committed about once a second, at the next poll after the second has passed,
+  instead of on a timer of their own; also before partitions are taken away and when the consumer closes. A failed
+  commit is not retried three times as in FlowLink, but at the next commit, and is logged only with `-debug`
+  (`Kafka offset commit failed: <error>`). FlowLink discards the error.
+- **`version`** is only used to refuse consumer groups below 0.10.2.0. The protocol versions are negotiated with the
+  brokers; FlowLink's client derives them from `version`. A version part too large for 32 bits makes the version
+  invalid; FlowLink leaves that part 0.
+- **One client certificate.** Of the certificate and key pairs in `broker_certs` and `broker_keys`, only the first
+  is offered to the brokers; the others are loaded and checked, and a bad one stops the start. FlowLink configures all
+  pairs.
+- **Log order.** When properties are missing, an invalid-version line comes before the `Missing kafka property:`
+  lines; FlowLink logs it after them. The schema makes this case impossible in a config file.
+- **`-debug`.** The time in `Message claimed: ... timestamp:` is printed in RFC 3339 form
+  (`2026-11-06T22:17:04.751+00:00`), not Go's.
+- **`kafka exiting`** is logged by every consumer instance at shutdown. FlowLink's idle consumers are ended by the
+  process exit without a line.
 
 ## Fixed quirks
 
@@ -100,6 +145,14 @@ Bugs in the original that FlowPilot does not copy. None of them changes the data
 | Text parser, timestamp spanning past the last field | Panic, process exits. | Logs `Invalid time:` and uses the current time. |
 | Parser workers after their input stops | Workers spin, logging in a loop. | Workers stop. |
 | Debug lines for config defaults | Logged in random order. | Logged in schema order. |
+| Secrets in `-debug` (PCE Kafka mode, Kafka input) | Logs the gateway's answer and the Kafka settings with the connection string, and the client certificate and private key PEM blocks of a Kafka input connector. | Logs the settings with the connection string as `********` (`config.Kafka: {<servers> <topic> ******** <max>}`). PEM content is never logged. |
+| Kafka input: client certificate or key that does not load | Silently connects without TLS. | Logs `Error: <error>` and exits 1. |
+| Kafka input: reconnect after a client error | The old group member is never closed and leaks, one per error. | The member commits its offsets and leaves the group before the next connect, and also at shutdown. |
+| Kafka input: messages over 64 KiB | Cut at 65 536 bytes without notice. | Passed to the parser whole. |
+| Kafka input: negative `instances` | Panic. | `Invalid kafka instances value: <n>`; the connector does not start. |
+| Kafka input: stop while idle or while waiting to reconnect | An idle consumer only notices after the next message; the 60-second wait between connection attempts is not interrupted. | Both notice within a second, then `kafka exiting`. |
+| Kafka input: a message received while stopping | Dropped. | Handed to the parser, which drains for 5 seconds as usual. |
+| PCE Kafka mode: producer at shutdown | Not closed. | Closed after the last window is written. Nothing changes for data, since every send waits for its acknowledgement. |
 
 ## Preserved on purpose
 
@@ -126,3 +179,23 @@ surprised.
 - Text parser: `||` in `only_recs` is not an OR; a failed timestamp falls back
   to the current time.
 - `-debug` makes processing errors fatal, so it is for test hosts only.
+
+PCE Kafka mode and the Kafka input connector:
+
+- The message key is `<org_id>+<local time>Z`, for example `1+2026-11-05T15:03:07Z`: local time with a literal `Z`,
+  taken when the message is sent, not when the window ended. A retried file gets a new key.
+- The producer sends FlowLink's client id and picks the partition with the same key hash.
+- `maxObjectsPerMessage` replaces `max_flows_per_post` unchecked. When it is 0 (or absent), the window written at
+  shutdown is not sent before exit; it stays in the spool for the next start.
+- Kafka connections never use the HTTP proxy, only the gateway request does.
+- SASL PLAIN with the user `$ConnectionString` and the connection string as password.
+- If the producer cannot connect at start, the process exits 1 at once; there is no retry.
+- Every send error is retried, with the usual backoff, until the file's retention ends; also a file too large for one
+  message.
+- `pceHost` in the gateway request is `pce_addr` up to the first `:` (an IPv6 literal is cut), not URL-encoded. The
+  header's PCE host is `pce_addr` with its port.
+- After a 404, a `kafka_info` that does not parse logs the 404 body, not the file content.
+- A new consumer group starts at the oldest offset.
+- The exporter address of a Kafka input message is the first entry of `brokers` as written.
+- A consumer that cannot connect retries every 60 seconds and exits the process after 20 minutes:
+  `Unable to connect to kafka brokers: <brokers> for 20 minutes. Exiting.`

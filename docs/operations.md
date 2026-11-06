@@ -473,6 +473,12 @@ Start by reading the log from the start of the run: `journalctl -u flowpilot --s
    Apache-2.0, MIT, BSD-3-Clause, ISC, Unicode-3.0, MIT-0 and CDLA-Permissive-2.0; the last one is for
    `webpki-roots`, which the Kafka consumer library depends on.
 
+4. The built-in Integrations gateway is compiled in from two repository secrets, `FLOWPILOT_BUILD_GATEWAY` and
+   `FLOWPILOT_BUILD_GATEWAY_STAGING_DOMAIN`. Both must exist before you tag: the `verify` job fails when either is empty,
+   and also when either value appears anywhere in the tracked tree. A binary built without them has no built-in gateway,
+   and `-version` says so (`Built-in Integrations gateway: no`); the release smoke tests require `yes`. A local
+   `tools/build-static.sh` build has no built-in gateway unless you export both variables first.
+
 Users install with the one-liner, which verifies the checksum before running `flowpilot install`:
 
 ```

@@ -2,6 +2,8 @@
 # Build static musl binaries for x86_64 and aarch64 Linux in Docker (works on a Mac or any Docker host).
 # Output: dist/flowpilot-<version>-<arch>-linux and dist/SHA256SUMS
 # Usage: tools/build-static.sh
+# The built-in Integrations gateway comes from FLOWPILOT_BUILD_GATEWAY and FLOWPILOT_BUILD_GATEWAY_STAGING_DOMAIN in the
+# caller's environment (the release workflow sets them from secrets). Without them the binary has no built-in gateway.
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")/.." && pwd)
 IMAGE=rust:1.97.1-bookworm
@@ -21,6 +23,7 @@ docker run --rm \
   -v flowpilot-build-tools:/opt/tools \
   -e ZIG_VERSION=$ZIG_VERSION -e ZIG_SHA256_X86_64=$ZIG_SHA256_X86_64 -e ZIG_SHA256_AARCH64=$ZIG_SHA256_AARCH64 \
   -e ZIGBUILD_VERSION=$ZIGBUILD_VERSION -e TARGETS="$TARGETS" -e VERSION=$VERSION \
+  -e FLOWPILOT_BUILD_GATEWAY -e FLOWPILOT_BUILD_GATEWAY_STAGING_DOMAIN \
   "$IMAGE" bash -c '
     set -euo pipefail
     export PATH=/opt/tools/zig:/opt/tools/bin:$PATH
@@ -48,4 +51,5 @@ docker run --rm \
     done
     cd dist && sha256sum flowpilot-$VERSION-*-linux > SHA256SUMS'
 echo "built: $REPO/dist"
+if [ -n "${FLOWPILOT_BUILD_GATEWAY:-}" ]; then echo "built-in Integrations gateway: yes"; else echo "built-in Integrations gateway: no"; fi
 cat "$REPO/dist/SHA256SUMS"

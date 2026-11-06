@@ -19,6 +19,19 @@ jobs:
             echo "tag $GITHUB_REF_NAME does not match Cargo.toml version $want" >&2
             exit 1
           fi
+      - name: Release secrets are set and not in the tree
+        env:
+          GW: ${{ secrets.FLOWPILOT_BUILD_GATEWAY }}
+          STAGING: ${{ secrets.FLOWPILOT_BUILD_GATEWAY_STAGING_DOMAIN }}
+        run: |
+          if [ -z "$GW" ] || [ -z "$STAGING" ]; then
+            echo "release secrets FLOWPILOT_BUILD_GATEWAY / FLOWPILOT_BUILD_GATEWAY_STAGING_DOMAIN are not set" >&2
+            exit 1
+          fi
+          if git grep -qiF -e "$GW" -e "$STAGING"; then
+            echo "a built-in gateway name is present in the tree (name not printed)" >&2
+            exit 1
+          fi
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
@@ -45,7 +58,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-      - run: tools/build-static.sh
+      - name: Build static binaries
+        env:
+          FLOWPILOT_BUILD_GATEWAY: ${{ secrets.FLOWPILOT_BUILD_GATEWAY }}
+          FLOWPILOT_BUILD_GATEWAY_STAGING_DOMAIN: ${{ secrets.FLOWPILOT_BUILD_GATEWAY_STAGING_DOMAIN }}
+        run: tools/build-static.sh
       - uses: taiki-e/install-action@v2
         with:
           tool: cargo-about@0.9.2
@@ -55,7 +72,8 @@ jobs:
         run: |
           docker run --rm --privileged tonistiigi/binfmt:qemu-v8.1.5 --install arm64
           bin=$(ls dist/flowpilot-*-aarch64-linux)
-          docker run --rm --platform linux/arm64 -v "$PWD/dist:/dist:ro" debian:bookworm-slim "/dist/$(basename "$bin")" -version
+          docker run --rm --platform linux/arm64 -v "$PWD/dist:/dist:ro" debian:bookworm-slim "/dist/$(basename "$bin")" -version | tee "$RUNNER_TEMP/version-arm64.txt"
+          grep -qF 'Built-in Integrations gateway: yes' "$RUNNER_TEMP/version-arm64.txt"
           cat > "$RUNNER_TEMP/smoke.yaml" <<'YAML'
           pce_addr: pce.example.invalid:8443
           org_id: 1
@@ -74,7 +92,8 @@ jobs:
       - name: Smoke test the x86_64 binary
         run: |
           bin=$(ls dist/flowpilot-*-x86_64-linux)
-          "$bin" -version
+          "$bin" -version | tee "$RUNNER_TEMP/version-x86_64.txt"
+          grep -qF 'Built-in Integrations gateway: yes' "$RUNNER_TEMP/version-x86_64.txt"
           CONFIG_FILE="$RUNNER_TEMP/smoke.yaml" "$bin" -print-config >/dev/null
       - uses: actions/upload-artifact@v4
         with:

@@ -2,6 +2,7 @@
 
 use std::sync::Arc;
 
+use base64::prelude::{Engine, BASE64_STANDARD};
 use rustls::client::danger::{HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier};
 use rustls::crypto::{ring, CryptoProvider};
 use rustls::pki_types::pem::PemObject;
@@ -48,8 +49,31 @@ fn builder() -> (ConfigBuilder<ClientConfig, WantsVerifier>, Arc<CryptoProvider>
 /// The system trust store, shared by every config here. Unreadable or invalid entries are skipped.
 fn system_roots() -> RootCertStore {
     let mut roots = RootCertStore::empty();
-    roots.add_parsable_certificates(rustls_native_certs::load_native_certs().certs);
+    roots.add_parsable_certificates(system_root_certs());
     roots
+}
+
+/// The same trust anchors as `system_roots()`, as PEM, for clients that build their own TLS
+/// configuration.
+pub fn system_roots_pem() -> String {
+    let mut pem = String::new();
+    for cert in system_root_certs() {
+        pem.push_str("-----BEGIN CERTIFICATE-----\n");
+        let b64 = BASE64_STANDARD.encode(cert.as_ref());
+        for line in b64.as_bytes().chunks(64) {
+            pem.push_str(std::str::from_utf8(line).expect("base64 is ASCII"));
+            pem.push('\n');
+        }
+        pem.push_str("-----END CERTIFICATE-----\n");
+    }
+    pem
+}
+
+/// The system certificates (`SSL_CERT_FILE` / `SSL_CERT_DIR` when set, as for Go) that parse as
+/// trust anchors.
+fn system_root_certs() -> Vec<CertificateDer<'static>> {
+    let mut probe = RootCertStore::empty();
+    rustls_native_certs::load_native_certs().certs.into_iter().filter(|c| probe.add(c.clone()).is_ok()).collect()
 }
 
 /// Accepts any server certificate; signatures are still checked so the handshake is well-formed.
@@ -108,6 +132,14 @@ mod tests {
     fn server_config_has_no_client_certificate() {
         assert!(!server_config(true).client_auth_cert_resolver.has_certs());
         assert!(!server_config(false).client_auth_cert_resolver.has_certs());
+    }
+
+    #[test]
+    fn system_roots_pem_holds_the_system_anchors() {
+        let pem = system_roots_pem();
+        let certs = CertificateDer::pem_slice_iter(pem.as_bytes()).collect::<Result<Vec<_>, _>>().unwrap();
+        assert_eq!(certs.len(), system_roots().len());
+        assert!(pem.lines().all(|l| l.len() <= 64));
     }
 
     #[test]

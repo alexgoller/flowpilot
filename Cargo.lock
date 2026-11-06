@@ -396,6 +396,7 @@ dependencies = [
 name = "flowpilot"
 version = "0.9.0"
 dependencies = [
+ "base64 0.22.1",
  "chrono",
  "crossbeam-channel",
  "dialoguer",

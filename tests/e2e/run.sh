@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Host driver: build Linux binaries in Docker, then run the differential test in a container.
-# Usage: tests/e2e/run.sh [SCENARIO_SECS | unmanaged | envonly | kafka-out | kafka-pilot]
+# Usage: tests/e2e/run.sh [SCENARIO_SECS | unmanaged | envonly | kafka-out | kafka-pilot | kafka-in]
 #        (needs Docker with linux/amd64 emulation)
 # `unmanaged` runs the unmanaged-workload scenario against a mock PCE instead (about 6 minutes).
 # `envonly` runs FlowPilot configured by FLOWPILOT_* variables only, against a mock PCE (about 6 minutes).
@@ -8,6 +8,8 @@
 #   (tests/kafka/broker.sh) and mock Integrations gateways. Local only: needs original/ and
 #   re/e2e/flowlink_gateway_host (FlowLink's built-in gateway name, never printed); SKIPs without them.
 # `kafka-pilot` runs FlowPilot alone in PCE Kafka mode (CI; no flowgen, no original/; about 6 minutes).
+# `kafka-in` runs the Kafka input differential, FlowLink vs FlowPilot, consuming from the test broker over
+#   PLAINTEXT and mTLS, against mock PCEs. Local only: needs original/; SKIPs without it.
 set -euo pipefail
 REPO=$(cd "$(dirname "$0")/../.." && pwd)
 # The traffic generator is https://github.com/alexgoller/illumio-flowgen, checked out next to this repository.
@@ -20,10 +22,13 @@ if [ "$MODE" = kafka-out ]; then
   [ -x "$REPO/original/usr/local/bin/flowlink" ] || { echo "SKIPPED: original/usr/local/bin/flowlink not present"; exit 0; }
   [ -s "$REPO/re/e2e/flowlink_gateway_host" ] || { echo "SKIPPED: re/e2e/flowlink_gateway_host not present"; exit 0; }
 fi
+if [ "$MODE" = kafka-in ]; then
+  [ -x "$REPO/original/usr/local/bin/flowlink" ] || { echo "SKIPPED: original/usr/local/bin/flowlink not present"; exit 0; }
+fi
 
 FLOWGEN_BUILD='cd /src/flowgen && CARGO_TARGET_DIR=/src/flowpilot/target/flowgen-linux-amd64 cargo build --release --quiet --locked'
 FLOWGEN_MOUNT=(-v "$FLOWGEN_SRC":/src/flowgen:ro)
-if [ "$MODE" = kafka-pilot ]; then
+if [ "$MODE" = kafka-pilot ] || [ "$MODE" = kafka-in ]; then
   FLOWGEN_BUILD=true
   FLOWGEN_MOUNT=()
 fi
@@ -36,15 +41,26 @@ docker run --rm --platform linux/amd64 \
     cd /src/flowpilot && CARGO_TARGET_DIR=target/linux-amd64 cargo build --release --quiet --example kafka_tool
     $FLOWGEN_BUILD"
 
-if [ "$MODE" = kafka-out ] || [ "$MODE" = kafka-pilot ]; then
+if [ "$MODE" = kafka-out ] || [ "$MODE" = kafka-pilot ] || [ "$MODE" = kafka-in ]; then
   BROKER=$REPO/tests/kafka/broker.sh
   trap '"$BROKER" down network' EXIT
   "$BROKER" up network
-  for topic in flows-orig flows-pilot; do
+  TOPICS=(flows-orig flows-pilot)
+  [ "$MODE" = kafka-in ] && TOPICS=(flows-plain flows-tls)
+  for topic in "${TOPICS[@]}"; do
     docker exec flowpilot-kafka /opt/kafka/bin/kafka-topics.sh --bootstrap-server localhost:9092 --create \
       --topic "$topic" --partitions 3 --replication-factor 1 >/dev/null
   done
   BIN=/w/target/linux-amd64/release
+  if [ "$MODE" = kafka-in ]; then
+    st=0
+    docker run --rm --platform linux/amd64 --network flowpilot-e2e \
+      -v "$REPO":/w:ro -v "$REPO/target":/w/target \
+      "$IMAGE" bash /w/tests/e2e/kafka_in.sh /w/target/kafka-certs "$BIN/examples/kafka_tool" \
+        /w/target/e2e-kafka-in "$BIN/flowpilot" /w/original/usr/local/bin/flowlink || st=$?
+    echo "artifacts: $REPO/target/e2e-kafka-in"
+    exit $st
+  fi
   ARGS=(/w/target/kafka-certs "$BIN/examples/kafka_tool" "/w/target/e2e-$MODE" "$BIN/flowpilot")
   EXTRA=()
   if [ "$MODE" = kafka-out ]; then

@@ -18,11 +18,8 @@ rm -rf "$OUT" && mkdir -p "$OUT"
 cd "$OUT"
 umask 077
 printf 'api_test secret_test\n' > api_info
-
-FAILED=0
-pass() { echo "PASS: $*"; }
-fail() { echo "FAIL: $*"; FAILED=1; }
-check() { local what=$1; shift; if "$@"; then pass "$what"; else fail "$what"; fi; }
+# shellcheck source=tests/e2e/lib.sh
+. "$HERE/lib.sh"
 
 # The Integrations JSON for TOPIC, with the broker's connection string (read from a file, never from argv).
 gateway_body() {
@@ -88,35 +85,12 @@ YAML
 
 # The inside.sh syslog set (48 lines) to 127.0.0.1:PORT.
 send_syslog() {
-  python3 - "$1" <<'PY'
-import socket, sys, time
+  syslog_lines | python3 -c '
+import socket, sys
 s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-ts = time.strftime("%b %d %Y %H:%M:%S", time.gmtime())
-lines = [
-    f"sip=10.50.0.{i} dip=10.60.0.{i % 7} dport={443 if i % 2 else 22} prot=6 date_time={ts}" for i in range(1, 40)
-] + [f"sip=10.50.1.{i} dip=10.60.1.1 dport=53 prot=udp date_time={ts}" for i in range(1, 10)]
-for l in lines:
+for l in sys.stdin.read().splitlines():
     s.sendto(l.encode(), ("127.0.0.1", int(sys.argv[1])))
-PY
-}
-
-# FILE PATTERN SECS: wait until FILE contains PATTERN (fixed string).
-wait_for() {
-  for _ in $(seq "$3"); do grep -qF "$2" "$1" 2>/dev/null && return 0; sleep 1; done
-  return 1
-}
-
-# PID: wait up to 60 s for it to exit, then kill it (status 137); its exit status goes to $REAPED (not a
-# subshell: wait needs the parent).
-reap() {
-  for _ in $(seq 60); do kill -0 "$1" 2>/dev/null || break; sleep 1; done
-  if kill -0 "$1" 2>/dev/null; then
-    kill -KILL "$1" 2>/dev/null || true
-    wait "$1" 2>/dev/null || true
-    REAPED=137
-    return
-  fi
-  REAPED=0; wait "$1" || REAPED=$?
+' "$1"
 }
 
 # Neither the log nor anything else FlowPilot wrote there holds the connection string.

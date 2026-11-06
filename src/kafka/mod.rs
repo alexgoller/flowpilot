@@ -7,6 +7,7 @@
 //! effect (the calling sender waits for the broker's ack).
 
 pub mod gateway;
+pub mod group;
 pub mod input;
 pub mod bootstrap;
 pub mod producer;

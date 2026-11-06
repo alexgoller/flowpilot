@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::fmt;
+use std::future::Future;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -132,20 +133,42 @@ struct Committer {
 }
 
 impl Committer {
-    /// Commits the marks of `partitions` (all when `None`); failed ones stay marked.
-    async fn commit(&self, consumer: &Consumer, partitions: Option<&[TopicPartition]>) -> Result<(), String> {
+    /// Commits the marks of `partitions` (all when `None`) through `send`. On failure the marks are
+    /// put back when `restore`, else dropped.
+    async fn commit_with<F, Fut>(&self, partitions: Option<&[TopicPartition]>, restore: bool, send: F) -> Result<(), String>
+    where
+        F: FnOnce(Vec<(TopicPartition, OffsetAndMetadata)>) -> Fut,
+        Fut: Future<Output = Result<(), String>>,
+    {
         let taken = take_marks(&mut self.marks.lock().unwrap(), partitions);
         if taken.is_empty() {
             return Ok(());
         }
-        let offsets: Vec<(TopicPartition, OffsetAndMetadata)> = taken
+        let offsets = taken
             .iter()
             .map(|((t, p), o)| (TopicPartition::new(t.clone(), *p), OffsetAndMetadata::new(*o)))
             .collect();
-        consumer.commit_offsets(offsets).await.map_err(|e| {
+        let r = send(offsets).await;
+        if r.is_err() && restore {
             restore_marks(&mut self.marks.lock().unwrap(), taken);
-            e.to_string()
-        })
+        }
+        r
+    }
+
+    /// Commits the marks of `partitions` (all when `None`); failed ones stay marked.
+    async fn commit(&self, consumer: &Consumer, partitions: Option<&[TopicPartition]>) -> Result<(), String> {
+        self.commit_with(partitions, true, |o| async move { consumer.commit_offsets(o).await.map_err(|e| e.to_string()) })
+            .await
+    }
+
+    /// Commits the marks of `partitions` before they are revoked. Failed ones are dropped: another
+    /// member may own the partitions by the next commit, which would rewind its offset.
+    async fn commit_revoked<F, Fut>(&self, partitions: &[TopicPartition], send: F) -> Result<(), String>
+    where
+        F: FnOnce(Vec<(TopicPartition, OffsetAndMetadata)>) -> Fut,
+        Fut: Future<Output = Result<(), String>>,
+    {
+        self.commit_with(Some(partitions), false, send).await
     }
 }
 
@@ -154,7 +177,8 @@ impl ConsumerRebalanceListener for Committer {
 
     async fn on_partitions_revoked(&self, partitions: &[TopicPartition]) {
         let Some(consumer) = self.consumer.get().and_then(Weak::upgrade) else { return };
-        if let Err(e) = self.commit(&consumer, Some(partitions)).await {
+        let send = |o| async move { consumer.commit_offsets(o).await.map_err(|e| e.to_string()) };
+        if let Err(e) = self.commit_revoked(partitions, send).await {
             debug_log!("Kafka offset commit failed:", e);
         }
     }
@@ -358,6 +382,45 @@ mod tests {
         let all = take_marks(&mut m, None);
         assert_eq!(all.len(), 4);
         assert!(m.is_empty());
+    }
+
+    fn committer(marks: &[(&str, i32, i64)]) -> Committer {
+        let c = Committer { marks: Mutex::new(Marks::new()), consumer: OnceLock::new() };
+        for (t, p, o) in marks {
+            add_mark(&mut c.marks.lock().unwrap(), &msg(t, *p, *o));
+        }
+        c
+    }
+
+    async fn fail(_: Vec<(TopicPartition, OffsetAndMetadata)>) -> Result<(), String> {
+        Err("commit failed".into())
+    }
+
+    #[test]
+    fn failed_commit_on_revocation_drops_the_marks() {
+        let c = committer(&[("t", 0, 4), ("t", 1, 7)]);
+        let r = runtime().block_on(c.commit_revoked(&[TopicPartition::new("t", 0)], fail));
+        assert_eq!(r.unwrap_err(), "commit failed");
+        // Another member may own t/0 now: a later commit must not rewind its offset.
+        assert_eq!(*c.marks.lock().unwrap(), Marks::from([(("t".into(), 1), 8)]));
+    }
+
+    #[test]
+    fn failed_periodic_or_close_commit_keeps_the_marks() {
+        let c = committer(&[("t", 0, 4), ("t", 1, 7)]);
+        let before = c.marks.lock().unwrap().clone();
+        assert!(runtime().block_on(c.commit_with(None, true, fail)).is_err());
+        assert_eq!(*c.marks.lock().unwrap(), before);
+        let sent = Mutex::new(vec![]);
+        let ok = |o: Vec<(TopicPartition, OffsetAndMetadata)>| {
+            sent.lock().unwrap().extend(o.into_iter().map(|(tp, om)| (tp.topic, tp.partition, om.offset)));
+            async { Ok(()) }
+        };
+        runtime().block_on(c.commit_with(None, true, ok)).unwrap();
+        assert!(c.marks.lock().unwrap().is_empty());
+        let mut sent = sent.into_inner().unwrap();
+        sent.sort();
+        assert_eq!(sent, vec![("t".into(), 0, 5), ("t".into(), 1, 8)]);
     }
 
     #[test]

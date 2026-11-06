@@ -50,3 +50,21 @@ jobs:
         with:
           workspaces: fuzz
       - run: cargo check --locked --manifest-path fuzz/Cargo.toml --all-targets
+
+  kafka:
+    # PCE Kafka mode against the test broker: the producer and consumer-group tests, then the FlowPilot-only
+    # end-to-end scenario (the FlowLink differential is local only).
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: tests/kafka/broker.sh up host
+      - run: cargo test --locked --test kafka_producer --test kafka_group
+        env:
+          FLOWPILOT_TEST_KAFKA: localhost:9092
+          FLOWPILOT_TEST_KAFKA_SASL: localhost:9093
+          FLOWPILOT_TEST_KAFKA_TLS: localhost:9094
+          SSL_CERT_FILE: target/kafka-certs/ca.pem
+      - run: tests/kafka/broker.sh down
+      - run: tests/e2e/run.sh kafka-pilot

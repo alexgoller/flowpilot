@@ -1,7 +1,9 @@
 """Decode stored FlowLink uploads (gzip + UploadBatch proto2) into canonical JSON.
 
-Usage: decode_posts.py DIR  -> prints {"posts": n, "aggregation_seconds": [...], "records": [...]}
+Usage: decode_posts.py [--kafka] DIR  -> prints {"posts": n, "aggregation_seconds": [...], "records": [...]}
 Records are sorted; instance_id is reported separately. Field numbers: src/proto.rs.
+--kafka: DIR holds Kafka message values (kafka_tool dump); the PCE Kafka header fields org_id,
+installation_id and pce_host are reported as sets ("org_ids", ...) instead of as unexpected fields.
 """
 import glob
 import gzip
@@ -60,8 +62,13 @@ def record(b):
     return r
 
 
+args = sys.argv[1:]
+kafka = "--kafka" in args
+args = [a for a in args if a != "--kafka"]
+HEADER = ("org_id", "installation_id", "pce_host")
 posts, aggs, ids, recs = 0, [], set(), []
-for path in sorted(glob.glob(os.path.join(sys.argv[1], "*.pb.gz"))):
+header = {k: set() for k in HEADER}
+for path in sorted(glob.glob(os.path.join(args[0], "*.pb.gz"))):
     posts += 1
     for num, v in fields(gzip.decompress(open(path, "rb").read())):
         if TD[num] == "flows":
@@ -70,8 +77,12 @@ for path in sorted(glob.glob(os.path.join(sys.argv[1], "*.pb.gz"))):
             aggs.append(signed(v))
         elif TD[num] == "instance_id":
             ids.add(v.decode())
+        elif kafka and TD[num] in HEADER:
+            header[TD[num]].add(signed(v) if TD[num] == "org_id" else v.decode())
         else:
             recs.append({"unexpected_traffic_data_field": TD[num]})
 recs.sort(key=lambda r: json.dumps(r, sort_keys=True))
-print(json.dumps({"posts": posts, "aggregation_seconds": aggs, "instance_ids": sorted(ids), "records": recs},
-                 indent=1, sort_keys=True))
+out = {"posts": posts, "aggregation_seconds": aggs, "instance_ids": sorted(ids), "records": recs}
+if kafka:
+    out.update({k + "s": sorted(v) for k, v in header.items()})
+print(json.dumps(out, indent=1, sort_keys=True))

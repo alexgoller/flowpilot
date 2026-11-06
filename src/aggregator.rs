@@ -95,7 +95,7 @@ pub struct WindowReport {
 }
 
 /// The batch header fields of Kafka mode.
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KafkaHeader {
     pub org_id: i32,
     pub installation_id: String,

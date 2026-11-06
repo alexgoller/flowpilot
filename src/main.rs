@@ -14,9 +14,9 @@ use flowpilot::flow::FlowSink;
 use flowpilot::log::{DEBUG, SHUTDOWN};
 use flowpilot::parsers::{start_consumer, ParserContext};
 use flowpilot::spool::Spool;
-use flowpilot::uploader::{PceTarget, Uploader};
+use flowpilot::uploader::{MessageSink, PceTarget, Uploader};
 use flowpilot::unmanaged;
-use flowpilot::{cli, config, instance_id, log_line, metrics, stats};
+use flowpilot::{cli, config, instance_id, kafka, log_line, metrics, stats};
 
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 
@@ -25,6 +25,9 @@ static AGGREGATOR: OnceLock<Arc<Aggregator>> = OnceLock::new();
 
 /// The unmanaged-workload worker, when enabled; the signal handler hands it the final window.
 static UNMANAGED: OnceLock<unmanaged::worker::Handle> = OnceLock::new();
+
+/// The PCE Kafka producer, in Kafka mode; the signal handler closes it.
+static KAFKA: OnceLock<Arc<dyn MessageSink>> = OnceLock::new();
 
 fn main() {
     let args: Vec<String> = std::env::args().collect(); // includes argv[0] for the usage text
@@ -71,10 +74,11 @@ fn daemon(flags: cli::Flags) {
 
     let (api_user, api_token) = cfg.credentials();
     let instance = instance_id::load_or_create(&cfg.data_directory);
-    if !cfg.pce_kafka.installation_id.is_empty() {
-        // Deferred: the PCE Kafka (Integrations) bootstrap.
-        log_line!("PCE Kafka (Integrations) mode is not supported in this build");
-        std::process::exit(1);
+    // As in FlowLink: the Integrations bootstrap and the producer come after the credentials and
+    // the instance id, before the aggregator and the consumers.
+    let kafka = (!cfg.pce_kafka.installation_id.is_empty()).then(|| kafka::start_output(&cfg, &api_user, &api_token));
+    if let Some(k) = &kafka {
+        let _ = KAFKA.set(k.sink.clone());
     }
 
     // Bound before any collector starts, so a bad address or a port in use stops the start instead of leaving a
@@ -86,7 +90,8 @@ fn daemon(flags: cli::Flags) {
 
     let dir = std::fs::canonicalize(&cfg.data_directory).unwrap_or_else(|_| PathBuf::from(&cfg.data_directory));
     let spool = Arc::new(Spool::new(dir.clone(),cfg.file_retention_hours, cfg.data_directory_size_mb));
-    let agg = Arc::new(Aggregator::new(spool.clone(), &cfg.pce_addr, cfg.org_id, instance.clone(), cfg.max_flows_per_post, None));
+    let (max_per_post, kafka_header) = kafka::output_wiring(&cfg, kafka.as_ref());
+    let agg = Arc::new(Aggregator::new(spool.clone(), &cfg.pce_addr, cfg.org_id, instance.clone(), max_per_post, kafka_header));
     let (tx, rx) = crossbeam_channel::bounded(FLOW_CHANNEL_CAPACITY);
     agg.start(rx);
     let _ = AGGREGATOR.set(agg.clone());
@@ -120,12 +125,17 @@ fn daemon(flags: cli::Flags) {
         api_token,
         verify_cert: cfg.verify_pce_cert,
     };
-    // The unmanaged-workload counters, for the stats output.
+    // The unmanaged-workload counters, for the stats output. The worker uses the PCE REST API in
+    // Kafka mode too.
     let unmanaged_stats = unmanaged::worker::start(&cfg, &target, &dir).map(|(h, stats)| {
         let _ = UNMANAGED.set(h);
         stats
     });
-    Arc::new(Uploader::new(spool.clone(), target)).start();
+    let uploader = match &kafka {
+        Some(k) => Uploader::kafka(spool.clone(), k.sink.clone()),
+        None => Uploader::new(spool.clone(), target),
+    };
+    Arc::new(uploader).start();
     let stats_ctx = Arc::new(stats::SnapshotContext {
         version: VERSION.to_string(),
         instance_id: instance,
@@ -177,6 +187,10 @@ fn start_signal_handler() {
             if let Some(h) = UNMANAGED.get() {
                 h.shutdown(report, Duration::from_secs(5));
             }
+        }
+        // Divergence: FlowLink exits without closing its producer.
+        if let Some(p) = KAFKA.get() {
+            p.close(Duration::from_secs(5));
         }
         std::process::exit(0);
     });

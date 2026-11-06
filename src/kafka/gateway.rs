@@ -21,7 +21,7 @@ pub const BUILTIN_STAGING_DOMAIN: Option<&str> =
 pub const NO_GATEWAY: &str = "this build has no built-in Integrations gateway; set pce_kafka.gateway";
 
 /// The gateway to connect to: `pce_kafka.gateway` when set (it wins over `env_override`), else the
-/// built-in one, or `<env>-<staging domain>` for `env_override: stage`.
+/// built-in one, or `<env_override>-<staging domain>` for `env_override` `dev` or `stage`, as in FlowLink.
 pub fn gateway_host(k: &PceKafka) -> Result<String, String> {
     gateway_host_with(k, BUILTIN_GATEWAY, BUILTIN_STAGING_DOMAIN)
 }
@@ -37,7 +37,7 @@ pub(crate) fn gateway_host_with(
     let builtin = builtin.ok_or_else(|| NO_GATEWAY.to_string())?;
     match (k.env_override.as_str(), staging_domain) {
         ("", _) => Ok(builtin.to_string()),
-        ("stage", Some(domain)) => Ok(format!("stage-{domain}")),
+        (env, Some(domain)) => Ok(format!("{env}-{domain}")),
         _ => Err(NO_GATEWAY.to_string()),
     }
 }
@@ -67,6 +67,10 @@ mod tests {
             "stage-staging.example.test"
         );
         assert_eq!(gateway_host_with(&k("", ""), None, Some("staging.example.test")).unwrap_err(), NO_GATEWAY);
+        assert_eq!(
+            gateway_host_with(&k("dev", ""), Some("gw.example.test"), Some("staging.example.test")).unwrap(),
+            "dev-staging.example.test"
+        );
         assert_eq!(gateway_host_with(&k("dev", ""), Some("gw.example.test"), None).unwrap_err(), NO_GATEWAY);
     }
 

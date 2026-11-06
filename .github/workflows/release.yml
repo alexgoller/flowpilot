@@ -28,8 +28,13 @@ jobs:
             echo "release secrets FLOWPILOT_BUILD_GATEWAY / FLOWPILOT_BUILD_GATEWAY_STAGING_DOMAIN are not set" >&2
             exit 1
           fi
-          if git grep -qiF -e "$GW" -e "$STAGING"; then
+          rc=0
+          git grep -qiF -e "$GW" -e "$STAGING" || rc=$?
+          if [ "$rc" -eq 0 ]; then
             echo "a built-in gateway name is present in the tree (name not printed)" >&2
+            exit 1
+          elif [ "$rc" -ne 1 ]; then
+            echo "git grep failed (exit $rc) while checking the tree for a built-in gateway name" >&2
             exit 1
           fi
       - uses: dtolnay/rust-toolchain@stable

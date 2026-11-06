@@ -346,8 +346,8 @@ request to the Integrations gateway and the settings it returns are described in
 - **Senders.** Five senders, one second's pause after each file, as for the PCE.
 - **REST upload of flows is off.** Nothing is posted to `/traffic_data`. The [unmanaged workload](unmanaged-workloads.md)
   feature still uses the PCE REST API with the same `pce_addr` and key, so the PCE must stay reachable for it.
-- **Shutdown.** The last window is written as usual. With `maxObjectsPerMessage` 0 or absent it is not sent before
-  exit; it stays in the spool for the next start, as with FlowLink. The producer is closed last.
+- **Shutdown.** The last window is written as usual. With `maxObjectsPerMessage` 0 or less, or absent, it is not sent
+  before exit; it stays in the spool for the next start, as with FlowLink. The producer is closed last.
 
 **What was tested.** PCE Kafka mode was tested against an Apache Kafka 3.9 broker with SASL PLAIN over TLS and a mock
 gateway, and compared with FlowLink on the same traffic (see [testing.md](testing.md#kafka-tests)). It has not been

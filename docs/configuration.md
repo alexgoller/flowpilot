@@ -496,6 +496,7 @@ Errors:
 | `Missing kafka property: <key>` | The connector does not start. |
 | ``Error: invalid version `<version>` `` | The connector does not start. With `-debug` the process exits. |
 | `Invalid kafka instances value: <n>` | A negative `instances`; the connector does not start. |
+| `Invalid kafka instances value, must be numeric. Using default instances.` | A non-numeric `instances`; the default is used. |
 | `Missing script for broker certificate keys.` | `broker_certs` without `broker_keys`; exit 1. |
 | `Number of broker certs doesn't match number of broker keys.` | Exit 1. |
 | `Error: <error>` | A certificate or key does not load, or a key does not match its certificate; exit 1. |

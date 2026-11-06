@@ -173,6 +173,8 @@ default one per broker entry), all members of the consumer group `group`, which 
 - A new group starts at the oldest message of each partition; an existing group resumes after its committed offset.
   A message's offset is committed only after the parser has it, about once a second, so after a crash or a
   rebalance some messages can arrive twice (at least once).
+  A committed offset means the parser has the message, not that its flows were uploaded: flows reach disk only when
+  the window is written, so a crash or SIGKILL loses the window in memory, as with UDP and FlowLink.
 - The parser's own meter counts lines as usual; a shared `meter kafka` block counts the messages of all Kafka
   connectors.
 - If the brokers cannot be reached, the error is logged and the consumer tries again every 60 seconds. After 20

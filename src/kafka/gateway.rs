@@ -14,7 +14,7 @@ const fn non_empty(v: Option<&'static str>) -> Option<&'static str> {
 
 /// The gateway host compiled into this build, if any.
 pub const BUILTIN_GATEWAY: Option<&str> = non_empty(option_env!("FLOWPILOT_BUILD_GATEWAY"));
-/// The domain `env_override: stage` is resolved under, if this build has one.
+/// The domain `env_override` (`dev` or `stage`) is resolved under, if this build has one.
 pub const BUILTIN_STAGING_DOMAIN: Option<&str> =
     non_empty(option_env!("FLOWPILOT_BUILD_GATEWAY_STAGING_DOMAIN"));
 
@@ -34,6 +34,8 @@ pub(crate) fn gateway_host_with(
     if !k.gateway.is_empty() {
         return Ok(k.gateway.clone());
     }
+    // Divergence: a built-in production gateway is required even when env_override is set (FlowLink
+    // needs none there); release builds set both.
     let builtin = builtin.ok_or_else(|| NO_GATEWAY.to_string())?;
     match (k.env_override.as_str(), staging_domain) {
         ("", _) => Ok(builtin.to_string()),

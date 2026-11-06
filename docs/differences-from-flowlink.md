@@ -86,6 +86,10 @@ silently, as the original does.
   different Kafka client and differ. Errors in the Integrations JSON are FlowPilot's own wording, close to Go's.
 - **`Unable to process Integrations Kafka config:`** (status 200) is followed by the parse error, not the response
   body. FlowLink prints the body as a list of byte values, which contains the connection string.
+- **Other bootstrap errors.** A top-level JSON `null` as the Integrations config is a parse error (FlowLink: `No
+  Integrations kafka Servers configured`). `maxObjectsPerMessage: -0` is rejected (FlowLink reads it as 0). A
+  malformed `pce_kafka.gateway` value logs `Error sending Integrations kafka config request:` (FlowLink: `Error
+  creating Integrations API request:`). Each of these exits 1, as in FlowLink.
 
 ### Kafka input connector
 
@@ -99,7 +103,8 @@ silently, as the original does.
 - **Offset commits.** Offsets are committed about once a second, at the next poll after the second has passed,
   instead of on a timer of their own; also before partitions are taken away and when the consumer closes. A failed
   commit is not retried three times as in FlowLink, but at the next commit, and is logged only with `-debug`
-  (`Kafka offset commit failed: <error>`). FlowLink discards the error.
+  (`Kafka offset commit failed: <error>`). FlowLink discards the error. A failed commit before partitions are taken
+  away is not retried: another member may own them by then.
 - **`version`** is only used to refuse consumer groups below 0.10.2.0. The protocol versions are negotiated with the
   brokers; FlowLink's client derives them from `version`. A version part too large for 32 bits makes the version
   invalid; FlowLink leaves that part 0.
@@ -185,8 +190,8 @@ PCE Kafka mode and the Kafka input connector:
 - The message key is `<org_id>+<local time>Z`, for example `1+2026-11-05T15:03:07Z`: local time with a literal `Z`,
   taken when the message is sent, not when the window ended. A retried file gets a new key.
 - The producer sends FlowLink's client id and picks the partition with the same key hash.
-- `maxObjectsPerMessage` replaces `max_flows_per_post` unchecked. When it is 0 (or absent), the window written at
-  shutdown is not sent before exit; it stays in the spool for the next start.
+- `maxObjectsPerMessage` replaces `max_flows_per_post` unchecked. When it is 0 or less, or absent, the window written
+  at shutdown is not sent before exit; it stays in the spool for the next start.
 - Kafka connections never use the HTTP proxy, only the gateway request does.
 - SASL PLAIN with the user `$ConnectionString` and the connection string as password.
 - If the producer cannot connect at start, the process exits 1 at once; there is no retry.

@@ -161,13 +161,13 @@ pub fn render(s: &Snapshot) -> String {
         "Where flow files are sent: pce or kafka (always 1).",
         vec![(labels(&[("transport", u.transport)]), Value::Int(1))],
     );
-    o.counter("uploads_succeeded_total", "Files the PCE accepted.", one(Value::Int(u.succeeded)));
+    o.counter("uploads_succeeded_total", "Files the PCE accepted, or in Kafka mode the broker acknowledged.", one(Value::Int(u.succeeded)));
     o.counter(
         "uploads_failed_total",
         "Failed upload attempts, by HTTP status or \"error\".",
         u.failed.iter().map(|(k, n)| (labels(&[("kind", k)]), Value::Int(*n))).collect(),
     );
-    o.counter("uploaded_records_total", "Records in the files the PCE accepted.", one(Value::Int(u.records_uploaded)));
+    o.counter("uploaded_records_total", "Records in the files the PCE accepted, or in Kafka mode the broker acknowledged.", one(Value::Int(u.records_uploaded)));
     o.gauge("upload_last_success_timestamp_seconds", "Last accepted upload, Unix seconds.", opt(u.last_success_at, ts));
     o.gauge("upload_last_error_timestamp_seconds", "Last failed upload, Unix seconds.", opt(u.last_error_at, ts));
     o.gauge(

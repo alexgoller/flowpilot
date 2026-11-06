@@ -146,17 +146,26 @@ const STATS_KEYS: [(&str, Kind); 5] = [
     ("idle_warn_seconds", Kind::Int),
 ];
 
+/// `pce_kafka` keys settable as `FLOWPILOT_PCE_KAFKA_<KEY>`. None is secret: `kafka_info` is a path or `$command`.
+const PCE_KAFKA_KEYS: [(&str, Kind); 4] = [
+    ("installation_id", Kind::Str),
+    ("env_override", Kind::Str),
+    ("kafka_info", Kind::Str),
+    ("gateway", Kind::Str),
+];
+
 /// Keys of a section with their value type.
 type Keys = &'static [(&'static str, Kind)];
 
 /// The sections of nested keys: config key, variable prefix, keys.
-const SECTIONS: [(&str, &str, Keys); 2] = [
+const SECTIONS: [(&str, &str, Keys); 3] = [
     (
         "unmanaged_workloads",
         "FLOWPILOT_UNMANAGED_",
         &UNMANAGED_KEYS,
     ),
     ("stats", "FLOWPILOT_STATS_", &STATS_KEYS),
+    ("pce_kafka", "FLOWPILOT_PCE_KAFKA_", &PCE_KAFKA_KEYS),
 ];
 
 fn section_var(prefix: &str, key: &str) -> String {
@@ -663,11 +672,18 @@ pub fn variable_of<'a>(sources: &'a Sources, path: &str) -> Option<&'a str> {
 }
 
 /// For a schema `<key> is required` error at source path `path`: the variable that sets the missing key, when the
-/// consumer it belongs to was made by variables (`FLOWPILOT_TEXT_SRC_IP` for a text consumer from
+/// consumer it belongs to (or the section object) was made by variables (`FLOWPILOT_TEXT_SRC_IP` for a text consumer from
 /// `FLOWPILOT_TEXT_PORTS`). A consumer from the file is reported with the config key, as before.
 pub fn missing_variable(sources: &Sources, path: &str, key: &str) -> Option<String> {
     let var = var_for(&format!("{path}.{key}"))?;
-    let (consumer, _) = path.split_once("].")?;
+    let Some((consumer, _)) = path.split_once("].") else {
+        // A section object (`pce_kafka`): its variables made it if any of its keys came from one.
+        let prefix = format!("{path}.");
+        return sources
+            .iter()
+            .any(|(k, v)| k.starts_with(&prefix) && matches!(v, Source::Env(_)))
+            .then_some(var);
+    };
     matches!(
         sources.get(&format!("{consumer}].name")),
         Some(Source::Env(_))
@@ -892,7 +908,14 @@ mod tests {
             var_for("consumers[netflow].connectors[0].properties.ports").as_deref(),
             Some("FLOWPILOT_NETFLOW_PORTS")
         );
-        assert_eq!(var_for("pce_kafka.installation_id"), None);
+        assert_eq!(
+            var_for("pce_kafka.installation_id").as_deref(),
+            Some("FLOWPILOT_PCE_KAFKA_INSTALLATION_ID")
+        );
+        assert_eq!(
+            var_for("pce_kafka.gateway").as_deref(),
+            Some("FLOWPILOT_PCE_KAFKA_GATEWAY")
+        );
         assert!(any_flowpilot_var(
             &|k: &str| (k == "FLOWPILOT_NO_PROXY").then(|| "x".to_string())
         ));
@@ -1109,6 +1132,66 @@ mod tests {
     }
 
     #[test]
+    fn pce_kafka_from_variables() {
+        let o = ok(
+            None,
+            &[
+                ("FLOWPILOT_PCE_ADDR", "p:1"),
+                ("FLOWPILOT_API_USER", "u"),
+                ("FLOWPILOT_API_SECRET", "s"),
+                ("FLOWPILOT_NETFLOW_PORTS", "2055"),
+                ("FLOWPILOT_PCE_KAFKA_INSTALLATION_ID", "inst"),
+                ("FLOWPILOT_PCE_KAFKA_GATEWAY", "mock:8444"),
+            ],
+        );
+        assert_eq!(
+            o.doc["pce_kafka"],
+            json!({"installation_id": "inst", "gateway": "mock:8444"})
+        );
+        assert_eq!(
+            o.sources["pce_kafka.gateway"],
+            env("FLOWPILOT_PCE_KAFKA_GATEWAY")
+        );
+        let c = crate::config::validate(o.doc.to_string().as_bytes()).unwrap();
+        assert_eq!(c.pce_kafka.installation_id, "inst");
+        assert_eq!(c.pce_kafka.gateway, "mock:8444");
+        assert_eq!(c.pce_kafka.env_override, "");
+    }
+
+    #[test]
+    fn pce_kafka_variable_errors_name_the_variable() {
+        let base = [
+            ("FLOWPILOT_PCE_ADDR", "p:1"),
+            ("FLOWPILOT_API_USER", "u"),
+            ("FLOWPILOT_API_SECRET", "s"),
+            ("FLOWPILOT_NETFLOW_PORTS", "2055"),
+        ];
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().to_str().unwrap();
+        let check = |extra: &[(&str, &str)]| {
+            let mut vars: Vec<(String, String)> = base
+                .iter()
+                .chain(extra)
+                .chain(&[("FLOWPILOT_DATA_DIRECTORY", d)])
+                .map(|(k, v)| (k.to_string(), v.to_string()))
+                .collect();
+            vars.sort();
+            let env = move |k: &str| vars.iter().find(|(n, _)| n == k).map(|(_, v)| v.clone());
+            match crate::config::load_from("", &env) {
+                Err(crate::config::LoadError::Log(lines)) => lines.join("\n"),
+                other => panic!("expected a config error, got ok={}", other.is_ok()),
+            }
+        };
+        let m = check(&[
+            ("FLOWPILOT_PCE_KAFKA_INSTALLATION_ID", "i"),
+            ("FLOWPILOT_PCE_KAFKA_ENV_OVERRIDE", "prod"),
+        ]);
+        assert!(m.contains("FLOWPILOT_PCE_KAFKA_ENV_OVERRIDE (pce_kafka.env_override)"), "{m}");
+        let m = check(&[("FLOWPILOT_PCE_KAFKA_GATEWAY", "g:1")]);
+        assert!(m.contains("FLOWPILOT_PCE_KAFKA_INSTALLATION_ID"), "{m}");
+    }
+
+    #[test]
     fn unknown_flowpilot_vars_listed() {
         let names = [
             "FLOWPILOT_NETFLOW_PORT",
@@ -1117,6 +1200,7 @@ mod tests {
             "FLOWPILOT_STATS_INTERVAL_SECONDS",
             "FLOWPILOT_API_SECRET",
             "FLOWPILOT_UNMANAGED_DNS_SERVERS",
+            "FLOWPILOT_PCE_KAFKA_GATEWAY",
             "PCE_HOST",
             "HOME",
             "flowpilot_org_id",

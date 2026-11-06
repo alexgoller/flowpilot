@@ -400,7 +400,18 @@ error text says where the JSON is wrong, never what the values are.
 `KafkaProducer setup`. If the brokers cannot be reached, the login fails or the topic does not exist, it logs
 `Unable to create Kafka Producer: <error>` and exits 1, with no retry; systemd restarts the service.
 
-There is no `FLOWPILOT_*` variable for these keys yet.
+**Variables.** Each key has a variable:
+
+| Variable | Config key |
+|---|---|
+| `FLOWPILOT_PCE_KAFKA_INSTALLATION_ID` | `pce_kafka.installation_id` |
+| `FLOWPILOT_PCE_KAFKA_ENV_OVERRIDE` | `pce_kafka.env_override` |
+| `FLOWPILOT_PCE_KAFKA_KAFKA_INFO` | `pce_kafka.kafka_info` |
+| `FLOWPILOT_PCE_KAFKA_GATEWAY` | `pce_kafka.gateway` |
+
+As for every object, a setting without `installation_id` is an error that names the variable
+(`FLOWPILOT_PCE_KAFKA_INSTALLATION_ID`). `-print-config` shows the section when `installation_id` is set. It prints
+`kafka_info` as given (the path or `$command`) and never runs or reads it; the connection string is never printed.
 
 ### consumers
 

@@ -769,6 +769,20 @@ pub(crate) fn render_effective(l: &Loaded) -> String {
     line(0, "file_retention_hours", c.file_retention_hours.to_string(), "file_retention_hours");
     line(0, "metrics_print_seconds", c.metrics_print_seconds.to_string(), "metrics_print_seconds");
     line(0, "max_flows_per_post", c.max_flows_per_post.to_string(), "max_flows_per_post");
+    let k = &c.pce_kafka;
+    if !k.installation_id.is_empty() {
+        // None of it is secret: `kafka_info` is a path or `$command`, printed as given and never read here.
+        line(0, "pce_kafka", String::new(), "");
+        let keys = [
+            ("installation_id", &k.installation_id),
+            ("env_override", &k.env_override),
+            ("kafka_info", &k.kafka_info),
+            ("gateway", &k.gateway),
+        ];
+        for (key, v) in keys.iter().filter(|(_, v)| !v.is_empty()) {
+            line(2, key, q(v), &format!("pce_kafka.{key}"));
+        }
+    }
     let p = &c.proxy_config;
     let proxies = [
         ("https_proxy", &p.https_proxy),
@@ -1579,6 +1593,41 @@ mod tests {
         assert!(out.contains("pce_addr: h  # PCE_HOST (plugger)"), "{out}");
         assert!(out.contains("api_user: x  # PCE_API_KEY (plugger)"), "{out}");
         assert!(out.contains("api_secret: '********'  # PCE_API_KEY (plugger)"), "{out}");
+    }
+
+    #[test]
+    fn print_config_shows_pce_kafka() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().to_str().unwrap();
+        let path = dir.path().join("c.yaml");
+        std::fs::write(&path, "pce_kafka:\n  installation_id: from-file\n  kafka_info: $/bin/false\nconsumers:\n  - name: n\n    connectors:\n      - type: udp\n    parser:\n      type: netflow\n").unwrap();
+        let vars = [
+            ("FLOWPILOT_DATA_DIRECTORY", d),
+            ("FLOWPILOT_PCE_ADDR", "p:1"),
+            ("FLOWPILOT_API_USER", "u"),
+            ("FLOWPILOT_API_SECRET", "s"),
+            ("FLOWPILOT_PCE_KAFKA_INSTALLATION_ID", "inst"),
+        ];
+        let (code, out) = effective(path.to_str().unwrap(), &env_of(&vars), &[]);
+        assert_eq!(code, 0, "{out}");
+        assert!(
+            out.contains("pce_kafka:\n  installation_id: inst  # FLOWPILOT_PCE_KAFKA_INSTALLATION_ID"),
+            "{out}"
+        );
+        assert!(out.contains("\n  kafka_info: $/bin/false  # file\n"), "{out}");
+        assert!(!out.contains("env_override") && !out.contains("gateway"), "{out}");
+        let pos = |n: &str| out.find(n).unwrap();
+        assert!(pos("max_flows_per_post") < pos("pce_kafka:") && pos("pce_kafka:") < pos("consumers:"), "{out}");
+        // Without pce_kafka nothing is printed for it.
+        let (code, out) = effective("", &env_of(&[
+            ("FLOWPILOT_DATA_DIRECTORY", d),
+            ("FLOWPILOT_PCE_ADDR", "p:1"),
+            ("FLOWPILOT_API_USER", "u"),
+            ("FLOWPILOT_API_SECRET", "s"),
+            ("FLOWPILOT_NETFLOW_PORTS", "2055"),
+        ]), &[]);
+        assert_eq!(code, 0, "{out}");
+        assert!(!out.contains("pce_kafka"), "{out}");
     }
 
     #[test]

@@ -61,10 +61,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: Swatinem/rust-cache@v2
       - run: tests/kafka/broker.sh up host
-      - run: cargo test --locked --test kafka_producer --test kafka_group
+      # Without SSL_CERT_FILE: verify_cert_rejects_self_signed needs the test CA untrusted.
+      - run: cargo test --locked --test kafka_producer
+        env:
+          FLOWPILOT_TEST_KAFKA_SASL: localhost:9093
+      - run: cargo test --locked --test kafka_group
         env:
           FLOWPILOT_TEST_KAFKA: localhost:9092
-          FLOWPILOT_TEST_KAFKA_SASL: localhost:9093
           FLOWPILOT_TEST_KAFKA_TLS: localhost:9094
           SSL_CERT_FILE: target/kafka-certs/ca.pem
       - run: tests/kafka/broker.sh down

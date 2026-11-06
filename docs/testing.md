@@ -203,11 +203,14 @@ so a plain `cargo test` needs no broker.
 
 ```
 tests/kafka/broker.sh up host
+FLOWPILOT_TEST_KAFKA_SASL=localhost:9093 cargo test --test kafka_producer
 SSL_CERT_FILE=target/kafka-certs/ca.pem FLOWPILOT_TEST_KAFKA=localhost:9092 \
-  FLOWPILOT_TEST_KAFKA_SASL=localhost:9093 FLOWPILOT_TEST_KAFKA_TLS=localhost:9094 \
-  cargo test --test kafka_producer --test kafka_group
+  FLOWPILOT_TEST_KAFKA_TLS=localhost:9094 cargo test --test kafka_group
 tests/kafka/broker.sh down
 ```
+
+Run the two files separately: `kafka_producer` must run without `SSL_CERT_FILE`, or the test CA is trusted and the
+certificate check test fails.
 
 | Variable | Tests |
 |---|---|

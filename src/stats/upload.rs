@@ -17,8 +17,10 @@ pub fn uploads() -> &'static UploadStats {
 }
 
 /// Upload totals since start.
-#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub struct UploadSnapshot {
+    /// Where flow files are sent: `"pce"` (REST upload) or `"kafka"` (PCE Kafka mode).
+    pub transport: &'static str,
     pub succeeded: u64,
     /// By HTTP status (`"500"`) or `"error"` (no response).
     pub failed: BTreeMap<String, u64>,
@@ -39,28 +41,45 @@ pub struct UploadSnapshot {
     pub removed_by_retention: u64,
 }
 
+impl UploadSnapshot {
+    /// Nothing counted yet, REST transport.
+    const INITIAL: Self = Self {
+        transport: "pce",
+        succeeded: 0,
+        failed: BTreeMap::new(),
+        records_uploaded: 0,
+        last_success_at: None,
+        last_error: None,
+        last_error_at: None,
+        first_failure_since_success_at: None,
+        removed_by_cap: 0,
+        removed_by_retention: 0,
+    };
+}
+
+impl Default for UploadSnapshot {
+    fn default() -> Self {
+        Self::INITIAL
+    }
+}
+
 pub struct UploadStats(Mutex<UploadSnapshot>);
 
 impl UploadStats {
     pub const fn new() -> Self {
-        Self(Mutex::new(UploadSnapshot {
-            succeeded: 0,
-            failed: BTreeMap::new(),
-            records_uploaded: 0,
-            last_success_at: None,
-            last_error: None,
-            last_error_at: None,
-            first_failure_since_success_at: None,
-            removed_by_cap: 0,
-            removed_by_retention: 0,
-        }))
+        Self(Mutex::new(UploadSnapshot::INITIAL))
     }
 
     fn lock(&self) -> MutexGuard<'_, UploadSnapshot> {
         self.0.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// A file the PCE accepted.
+    /// The transport the senders use: `"pce"` (the default) or `"kafka"`.
+    pub fn set_transport(&self, t: &'static str) {
+        self.lock().transport = t;
+    }
+
+    /// A file the PCE (or the Kafka broker) accepted.
     pub fn on_success(&self, records: u64) {
         let mut s = self.lock();
         s.succeeded += 1;
@@ -139,6 +158,15 @@ mod tests {
         assert_eq!(redact_proxy_url("http://u:p@proxy:3128"), "http://***@proxy:3128");
         assert_eq!(redact_proxy_url("u:p@proxy:3128"), "***@proxy:3128");
         assert_eq!(redact_proxy_url("proxy:3128"), "proxy:3128");
+    }
+
+    #[test]
+    fn transport_defaults_to_pce_and_can_be_set() {
+        let st = UploadStats::new();
+        assert_eq!(st.snapshot().transport, "pce");
+        st.set_transport("kafka");
+        assert_eq!(st.snapshot().transport, "kafka");
+        assert_eq!(serde_json::to_value(st.snapshot()).unwrap()["transport"], "kafka");
     }
 
     #[test]

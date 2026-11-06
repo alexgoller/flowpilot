@@ -142,7 +142,7 @@ pub struct HttpPce {
 }
 
 impl HttpPce {
-    /// Built like `Uploader::client()`: http1 only, 60 s timeout; proxies come from the environment.
+    /// Built like the uploader's `client()`: http1 only, 60 s timeout; proxies come from the environment.
     pub fn new(target: &PceTarget) -> reqwest::Result<Self> {
         Ok(Self::with_client(target, Self::builder(target).build()?))
     }

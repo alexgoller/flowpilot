@@ -193,11 +193,12 @@ the start.
 
 | Field | Unit | Meaning |
 |---|---|---|
+| `transport` | | Where flow files are sent: `"pce"` (REST upload) or `"kafka"` (PCE Kafka mode). In Kafka mode, "accepted" below means the broker's ack. |
 | `succeeded` | count | Files the PCE accepted. |
-| `failed` | count by kind | Failed attempts, by HTTP status (`"503"`) or `"error"` when there was no response. Each retry counts. |
+| `failed` | count by kind | Failed attempts, by HTTP status (`"503"`) or `"error"` when there was no response. Each retry counts. In Kafka mode every failure is `"error"`. |
 | `records_uploaded` | count | Records in the accepted files. Files left over from an earlier run count 0, because their record count is not known. |
 | `last_success_at` | time | Last accepted upload. |
-| `last_error` | | Status line or transport error of the last failure. Credentials in a URL are replaced by `***`, and headers are never included. |
+| `last_error` | | Status line or transport error of the last failure. Credentials in a URL are replaced by `***`, and headers are never included. A Kafka error shows the connection string as `********`. |
 | `last_error_at` | time | Last failure. |
 | `first_failure_since_success_at` | time | First failure after the last success. `null` while uploads succeed. Drives `upload_failing`. |
 | `removed_by_size_cap` | count | Files deleted unsent to keep `data_directory_size_mb`. |
@@ -271,6 +272,7 @@ Unix seconds (`_timestamp_seconds`). A series whose value is `null` in the JSON 
 | `flowpilot_aggregation_last_flush_timestamp_seconds` | gauge | | `aggregation.last_flush_at` |
 | `flowpilot_aggregation_last_window_records` | gauge | | `aggregation.last_window_records` |
 | `flowpilot_aggregation_last_window_new_ips` | gauge | | `aggregation.last_window_new_ips` |
+| `flowpilot_upload_transport_info` | gauge (always 1) | `transport` (`pce`, `kafka`) | `uploads.transport` |
 | `flowpilot_uploads_succeeded_total` | counter | | `uploads.succeeded` |
 | `flowpilot_uploads_failed_total` | counter | `kind` | `uploads.failed` |
 | `flowpilot_uploaded_records_total` | counter | | `uploads.records_uploaded` |
@@ -382,6 +384,7 @@ The log line carries the same object on one line.
     "last_window_new_ips": 4
   },
   "uploads": {
+    "transport": "pce",
     "succeeded": 25,
     "failed": { "503": 1 },
     "records_uploaded": 241800,

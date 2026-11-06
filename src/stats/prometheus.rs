@@ -156,6 +156,11 @@ pub fn render(s: &Snapshot) -> String {
 
     // Uploads.
     let u = &s.uploads.totals;
+    o.gauge(
+        "upload_transport_info",
+        "Where flow files are sent: pce or kafka (always 1).",
+        vec![(labels(&[("transport", u.transport)]), Value::Int(1))],
+    );
     o.counter("uploads_succeeded_total", "Files the PCE accepted.", one(Value::Int(u.succeeded)));
     o.counter(
         "uploads_failed_total",
@@ -316,6 +321,7 @@ mod tests {
         let (mut ctx, uploads, _dir) = context(vec![c], StatsConfig::default());
         uploads.on_failure("503", "HTTP 503 Service Unavailable");
         uploads.on_success(30);
+        uploads.set_transport("kafka");
         ctx.unmanaged = Some(Arc::new(Mutex::new(UnmanagedStats { daily_cap: 100, ..Default::default() })));
         render(&snapshot(&ctx, at(200), None))
     }
@@ -339,9 +345,20 @@ mod tests {
             "flowpilot_uploads_failed_total{kind=\"503\"} 1",
             "flowpilot_uploaded_records_total 30",
             "flowpilot_unmanaged_daily_cap 100",
+            "# HELP flowpilot_upload_transport_info Where flow files are sent: pce or kafka (always 1).",
+            "# TYPE flowpilot_upload_transport_info gauge",
+            "flowpilot_upload_transport_info{transport=\"kafka\"} 1",
         ] {
             assert!(text.lines().any(|l| l == line), "missing {line:?} in\n{text}");
         }
+    }
+
+    #[test]
+    fn fresh_context_reports_pce_transport() {
+        let (ctx, _, _dir) = context(vec![], StatsConfig::default());
+        let text = render(&snapshot(&ctx, at(200), None));
+        let info: Vec<_> = text.lines().filter(|l| l.starts_with("flowpilot_upload_transport_info")).collect();
+        assert_eq!(info, vec!["flowpilot_upload_transport_info{transport=\"pce\"} 1"]);
     }
 
     #[test]

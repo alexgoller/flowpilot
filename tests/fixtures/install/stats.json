@@ -64,6 +64,7 @@
     "last_window_new_ips": 4
   },
   "uploads": {
+    "transport": "pce",
     "succeeded": 25,
     "failed": { "503": 1 },
     "records_uploaded": 241800,

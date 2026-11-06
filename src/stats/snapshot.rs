@@ -372,6 +372,7 @@ pub(crate) mod tests {
         assert_eq!(col["exporters"][0]["protocols"], serde_json::json!(["netflow_v9"]));
         assert_eq!(col["exporters"][0]["first_seen"], "2027-01-15T08:01:40Z");
         assert_eq!(v["uploads"]["failed"]["503"], 1);
+        assert_eq!(v["uploads"]["transport"], "pce");
         // Disabled unmanaged workloads are null.
         ctx.unmanaged = None;
         assert_eq!(serde_json::to_value(snapshot(&ctx, at(200), None)).unwrap()["unmanaged_workloads"], Value::Null);

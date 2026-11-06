@@ -26,12 +26,27 @@ pub fn shutdown() -> bool {
 
 /// Log line: timestamp `2006-01-02T15:04:05.000000-07:00` (local time) plus the operands.
 pub fn write_line(parts: &[String]) {
+    #[cfg(test)]
+    CAPTURED.with(|c| c.borrow_mut().as_mut().map(|v| v.push(parts.join(" "))));
     let ts = chrono::Local::now().format("%Y-%m-%dT%H:%M:%S%.6f%:z");
     let line = format!("{} {}\n", ts, parts.join(" "));
     let _guard = LOG_LOCK.lock().unwrap_or_else(|e| e.into_inner());
     let mut out = std::io::stdout().lock();
     let _ = out.write_all(line.as_bytes());
     let _ = out.flush();
+}
+
+#[cfg(test)]
+thread_local! {
+    static CAPTURED: std::cell::RefCell<Option<Vec<String>>> = const { std::cell::RefCell::new(None) };
+}
+
+/// Tests: runs `f` and returns the log lines it wrote on this thread, without timestamps (they are still printed).
+#[cfg(test)]
+pub fn capture(f: impl FnOnce()) -> Vec<String> {
+    CAPTURED.with(|c| *c.borrow_mut() = Some(Vec::new()));
+    f();
+    CAPTURED.with(|c| c.borrow_mut().take()).unwrap_or_default()
 }
 
 /// `log_line(a, b, ...)`: always printed.

@@ -89,7 +89,7 @@ fn check_size(len: usize) -> Result<(), String> {
 }
 
 /// Every error text leaves this module through here, so the connection string never shows.
-fn error_text(e: impl Display, secret: &str) -> String {
+pub(crate) fn error_text(e: impl Display, secret: &str) -> String {
     redact(&e.to_string(), secret)
 }
 

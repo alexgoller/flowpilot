@@ -1,4 +1,5 @@
-//! PCE upload senders (docs/operations.md, "Upload behaviour"). Kafka output is deferred.
+//! Spool senders (docs/operations.md, "Upload behaviour"): REST upload to the PCE, or one Kafka message per file in
+//! PCE Kafka mode.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -34,9 +35,25 @@ pub struct PceTarget {
     pub verify_cert: bool,
 }
 
+impl PceTarget {
+    /// The upload URL: `/traffic_data/flowlink`, or `/traffic_data` once `legacy` (after a 404).
+    pub fn url(&self, legacy: bool) -> String {
+        let suffix = if legacy { "" } else { "/flowlink" };
+        format!("https://{}/api/v{API_VERSION}/orgs/{}/traffic_data{suffix}", self.pce_addr, self.org_id)
+    }
+}
+
+/// Where the senders put each spool file.
+pub enum Transport {
+    /// REST upload to the PCE.
+    Pce(PceTarget),
+    /// PCE Kafka mode: one message per file, through the shared producer.
+    Kafka(Arc<dyn MessageSink>),
+}
+
 pub struct Uploader {
     spool: Arc<Spool>,
-    target: PceTarget,
+    transport: Transport,
     /// Set after a 404 on `/flowlink`: all senders switch to `/traffic_data` for good, as in FlowLink.
     legacy_url: AtomicBool,
 }
@@ -50,13 +67,13 @@ enum Outcome {
 
 impl Uploader {
     pub fn new(spool: Arc<Spool>, target: PceTarget) -> Self {
-        Self { spool, target, legacy_url: AtomicBool::new(false) }
+        Self { spool, transport: Transport::Pce(target), legacy_url: AtomicBool::new(false) }
     }
 
-    /// The upload URL.
-    pub fn url(&self) -> String {
-        let suffix = if self.legacy_url.load(Ordering::SeqCst) { "" } else { "/flowlink" };
-        format!("https://{}/api/v{API_VERSION}/orgs/{}/traffic_data{suffix}", self.target.pce_addr, self.target.org_id)
+    /// Senders for PCE Kafka mode; the stats report `transport: "kafka"` from here on.
+    pub fn kafka(spool: Arc<Spool>, sink: Arc<dyn MessageSink>) -> Self {
+        spool.stats().set_transport("kafka");
+        Self { spool, transport: Transport::Kafka(sink), legacy_url: AtomicBool::new(false) }
     }
 
     /// Start the senders. The startup directory scan must already have run.
@@ -69,23 +86,26 @@ impl Uploader {
             .collect()
     }
 
-    /// HTTP/1.1 only, `Connection: close` per request, as in FlowLink; proxy from the environment.
-    fn client(&self) -> reqwest::Result<Client> {
-        Client::builder()
-            .http1_only()
-            .timeout(REQUEST_TIMEOUT)
-            .danger_accept_invalid_certs(!self.target.verify_cert)
-            .build()
+    /// The PCE settings; only the REST transport has them.
+    fn target(&self) -> &PceTarget {
+        match &self.transport {
+            Transport::Pce(t) => t,
+            Transport::Kafka(_) => unreachable!("no PCE target in Kafka mode"),
+        }
     }
 
     /// One sender: take spool files and upload them, one at a time.
     fn sender_loop(&self) {
-        let client = match self.client() {
-            Ok(c) => c,
-            Err(e) => {
-                log_line!("Error creating request:", e);
-                return;
-            }
+        // No HTTP client in Kafka mode.
+        let client = match &self.transport {
+            Transport::Pce(t) => match client(t) {
+                Ok(c) => Some(c),
+                Err(e) => {
+                    log_line!("Error creating request:", e);
+                    return;
+                }
+            },
+            Transport::Kafka(_) => None,
         };
         while !shutdown() {
             let fd = self.spool.get();
@@ -104,15 +124,16 @@ impl Uploader {
                 continue;
             }
             self.spool.sending.fetch_add(1, Ordering::SeqCst);
-            self.send_with_retry(&client, &fd, &data);
+            self.send_with_retry(client.as_ref(), &fd, &data);
             self.spool.sending.fetch_sub(1, Ordering::SeqCst);
             thread::sleep(Duration::from_secs(1)); // pacing toward the PCE, as in FlowLink
         }
     }
 
-    /// Retry loop: backoff 10, 20, … 120 s; retention re-checked before each attempt.
-    fn send_with_retry(&self, client: &Client, fd: &SpoolFile, data: &[u8]) {
+    /// Retry loop: backoff 10, 20, … 120 s; retention re-checked before each attempt. `client` is `None` in Kafka mode.
+    fn send_with_retry(&self, client: Option<&Client>, fd: &SpoolFile, data: &[u8]) {
         let path = self.spool.path(fd);
+        let kafka = matches!(self.transport, Transport::Kafka(_));
         let mut sleep_secs = 10;
         loop {
             if self.spool.expired(fd) {
@@ -120,8 +141,8 @@ impl Uploader {
                 self.spool.delete(fd);
                 return;
             }
-            log_line!("Sending file:", path.display(), "kafkaSync:", false);
-            if self.post(client, fd, data, |u| u) == Outcome::Done {
+            log_line!("Sending file:", path.display(), "kafkaSync:", kafka);
+            if self.attempt(client, fd, data) == Outcome::Done {
                 return;
             }
             log_line!("Sleeping", sleep_secs, "seconds before retrying send of files.");
@@ -137,14 +158,37 @@ impl Uploader {
         }
     }
 
+    /// One attempt over the transport. In Kafka mode the file is deleted only after the broker's ack.
+    fn attempt(&self, client: Option<&Client>, fd: &SpoolFile, data: &[u8]) -> Outcome {
+        match &self.transport {
+            Transport::Pce(_) => self.post(client.expect("the PCE transport has an HTTP client"), fd, data, |u| u),
+            // As in FlowLink, every Kafka error retries until the file's retention ends.
+            Transport::Kafka(sink) => match sink.send(data) {
+                Ok((partition, offset)) => {
+                    log_line!("Sent kafka message to partition:", partition, "offset:", offset);
+                    self.spool.stats().on_success(fd.records);
+                    self.spool.delete(fd);
+                    Outcome::Done
+                }
+                Err(e) => {
+                    // The sink's error texts are already redacted.
+                    log_line!("Failed to send kafka message:", e);
+                    self.spool.stats().on_failure("error", &e);
+                    Outcome::Retry
+                }
+            },
+        }
+    }
+
     /// One POST, including the immediate re-POST after the `/flowlink` 404 fallback.
     /// `map_url` exists for tests (plain-HTTP server).
     fn post(&self, client: &Client, fd: &SpoolFile, data: &[u8], map_url: fn(String) -> String) -> Outcome {
         loop {
-            let url = self.url();
+            let target = self.target();
+            let url = target.url(self.legacy_url.load(Ordering::SeqCst));
             let resp = client
                 .post(map_url(url.clone()))
-                .basic_auth(&self.target.api_user, Some(&self.target.api_token))
+                .basic_auth(&target.api_user, Some(&target.api_token))
                 .header(CONTENT_TYPE, "application/x-protobuf")
                 .header(CONTENT_ENCODING, "gzip")
                 .header(CONNECTION, "close")
@@ -190,23 +234,28 @@ impl Uploader {
     }
 }
 
+/// HTTP/1.1 only, `Connection: close` per request, as in FlowLink; proxy from the environment.
+fn client(target: &PceTarget) -> reqwest::Result<Client> {
+    Client::builder()
+        .http1_only()
+        .timeout(REQUEST_TIMEOUT)
+        .danger_accept_invalid_certs(!target.verify_cert)
+        .build()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
+    use std::sync::Mutex;
     use crate::stats::UploadStats;
 
     #[test]
     fn url_format_and_fallback() {
-        let dir = tempfile::tempdir().unwrap();
-        let up = Uploader::new(
-            Arc::new(Spool::new(dir.path().to_path_buf(), 24, 500)),
-            PceTarget { pce_addr: "pce.example.com:8443".into(), org_id: 3, api_user: "u".into(), api_token: "t".into(), verify_cert: true },
-        );
-        assert_eq!(up.url(), "https://pce.example.com:8443/api/v2/orgs/3/traffic_data/flowlink");
-        up.legacy_url.store(true, Ordering::SeqCst);
-        assert_eq!(up.url(), "https://pce.example.com:8443/api/v2/orgs/3/traffic_data");
+        let target = PceTarget { pce_addr: "pce.example.com:8443".into(), org_id: 3, api_user: "u".into(), api_token: "t".into(), verify_cert: true };
+        assert_eq!(target.url(false), "https://pce.example.com:8443/api/v2/orgs/3/traffic_data/flowlink");
+        assert_eq!(target.url(true), "https://pce.example.com:8443/api/v2/orgs/3/traffic_data");
     }
 
     /// Minimal HTTP/1.1 server answering each request with the next status; records request heads.
@@ -332,8 +381,81 @@ mod tests {
         let fd = spool.get();
         let target = PceTarget { pce_addr: "127.0.0.1:9".into(), org_id: 1, api_user: "u".into(), api_token: "t".into(), verify_cert: true };
         let up = Uploader::new(spool, target);
-        up.send_with_retry(&Client::new(), &fd, b"gzdata");
+        up.send_with_retry(Some(&Client::new()), &fd, b"gzdata");
         assert_eq!(st.snapshot().removed_by_retention, 1);
         assert_eq!(up.spool.backlog(), (0, 0));
+    }
+
+    /// A sink that records each value and answers every send with the same result.
+    struct FakeSink(Mutex<Vec<Vec<u8>>>, Result<(i32, i64), String>);
+    impl MessageSink for FakeSink {
+        fn send(&self, v: &[u8]) -> Result<(i32, i64), String> {
+            self.0.lock().unwrap().push(v.to_vec());
+            self.1.clone()
+        }
+    }
+
+    /// A Kafka uploader on a spool with one queued file of 7 records and its own counters.
+    fn setup_kafka(result: Result<(i32, i64), String>) -> (Uploader, Arc<FakeSink>, SpoolFile, &'static UploadStats, tempfile::TempDir) {
+        let dir = tempfile::tempdir().unwrap();
+        let st: &'static UploadStats = Box::leak(Box::new(UploadStats::new()));
+        let spool = Arc::new(Spool::new(dir.path().to_path_buf(), 24, 500).with_stats(st));
+        spool.add(b"gzdata", 7, false);
+        let fd = spool.get();
+        let sink = Arc::new(FakeSink(Mutex::new(Vec::new()), result));
+        (Uploader::kafka(spool, sink.clone()), sink, fd, st, dir)
+    }
+
+    #[test]
+    fn kafka_success_sends_file_bytes_and_deletes() {
+        let (up, sink, fd, st, _dir) = setup_kafka(Ok((2, 41)));
+        let logs = crate::log::capture(|| up.send_with_retry(None, &fd, b"gzdata"));
+        assert_eq!(*sink.0.lock().unwrap(), vec![b"gzdata".to_vec()]);
+        assert!(!up.spool.path(&fd).exists());
+        assert_eq!(up.spool.backlog(), (0, 0));
+        let s = st.snapshot();
+        assert_eq!((s.succeeded, s.records_uploaded, s.failed.len()), (1, 7, 0));
+        assert_eq!(s.transport, "kafka");
+        let path = up.spool.path(&fd).display().to_string();
+        assert_eq!(logs, vec![
+            format!("Sending file: {path} kafkaSync: true"),
+            "Sent kafka message to partition: 2 offset: 41".to_string(),
+        ]);
+    }
+
+    #[test]
+    fn failed_kafka_send_keeps_file() {
+        let (up, sink, fd, st, _dir) = setup_kafka(Err("kafka: broker down".into()));
+        let logs = crate::log::capture(|| assert_eq!(up.attempt(None, &fd, b"gzdata"), Outcome::Retry));
+        assert_eq!(sink.0.lock().unwrap().len(), 1);
+        assert!(up.spool.path(&fd).exists());
+        let s = st.snapshot();
+        assert_eq!((s.succeeded, s.failed.get("error").copied()), (0, Some(1)));
+        assert_eq!(s.last_error.as_deref(), Some("kafka: broker down"));
+        assert!(s.first_failure_since_success_at.is_some());
+        assert_eq!(logs, vec!["Failed to send kafka message: kafka: broker down".to_string()]);
+    }
+
+    #[test]
+    fn kafka_failure_counts_error_without_secret() {
+        // The error text as `KafkaProducer` hands it out: through its one error-mapping path.
+        let err = crate::kafka::producer::error_text("auth failed: s3cr3t", "s3cr3t");
+        let (up, _sink, fd, st, _dir) = setup_kafka(Err(err));
+        let logs = crate::log::capture(|| assert_eq!(up.attempt(None, &fd, b"gzdata"), Outcome::Retry));
+        let s = st.snapshot();
+        assert_eq!(s.last_error.as_deref(), Some("auth failed: ********"));
+        assert_eq!(s.failed.get("error").copied(), Some(1));
+        assert_eq!(logs, vec!["Failed to send kafka message: auth failed: ********".to_string()]);
+        assert!(!format!("{s:?}{logs:?}").contains("s3cr3t"));
+    }
+
+    #[test]
+    fn pce_uploader_reports_pce_transport() {
+        let (addr, _rx) = serve(vec![204]);
+        let (up, fd, st, _dir) = setup(addr);
+        assert_eq!(st.snapshot().transport, "pce");
+        let logs = crate::log::capture(|| assert_eq!(up.post(&Client::new(), &fd, b"gzdata", plain), Outcome::Done));
+        assert_eq!(logs, vec!["Response Code 204".to_string()]);
+        assert_eq!(st.snapshot().transport, "pce");
     }
 }

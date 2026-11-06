@@ -1,5 +1,5 @@
-//! Data-source connectors. Only UDP is implemented;
-//! `tcp`, `kafka` and `aws` are deferred and rejected like an unknown connector type.
+//! Data-source connectors: UDP here, Kafka in `kafka::input`;
+//! `tcp` and `aws` are deferred and rejected like an unknown connector type.
 
 use std::collections::HashSet;
 use std::io;
@@ -25,8 +25,11 @@ pub fn start_connector(parser: Arc<dyn Parser>, conn_type: &str, properties: &Pr
         log_line!("Parser", parser.type_name(), "does not support connector", conn_type);
         return false;
     }
+    if conn_type == "kafka" {
+        return crate::kafka::input::start(parser, properties);
+    }
     if conn_type != "udp" {
-        // Deliberate divergence: FlowLink starts tcp/kafka/aws here (deferred scope).
+        // Deliberate divergence: FlowLink starts tcp/aws here (deferred scope).
         log_line!("Unsupported connector:", conn_type);
         return false;
     }
@@ -221,6 +224,73 @@ mod tests {
         assert_eq!(parse_go_uint16("+1"), None);
         assert_eq!(parse_go_uint16("1000-1010"), None);
         assert_eq!(parse_go_uint16(""), None);
+    }
+
+    /// A text parser that counts `start_workers` calls.
+    struct Spy {
+        inner: Arc<crate::parsers::text::TextParser>,
+        started: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Parser for Spy {
+        fn type_name(&self) -> &'static str {
+            self.inner.type_name()
+        }
+        fn default_port(&self) -> u16 {
+            self.inner.default_port()
+        }
+        fn supports_connector(&self, conn_type: &str) -> bool {
+            self.inner.supports_connector(conn_type)
+        }
+        fn start_workers(self: Arc<Self>, n: usize) -> crossbeam_channel::Sender<ReceivedDatagram> {
+            self.started.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.inner.clone().start_workers(n)
+        }
+        fn stats(&self) -> Arc<CollectorStats> {
+            self.inner.stats()
+        }
+    }
+
+    fn ctx() -> crate::parsers::ParserContext {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        crate::parsers::ParserContext::new(crate::metrics::Meter::new(), crate::flow::FlowSink::new(tx), Arc::default())
+    }
+
+    #[test]
+    fn kafka_connector_rejected_for_netflow() {
+        use crate::config::Info;
+        use crate::parsers::{ipfix, netflow, sflow};
+        let kafka = [Info { kind: "kafka".into(), properties: Properties::new() }];
+        type Setup = fn(&Properties, &[Info], crate::parsers::ParserContext) -> bool;
+        for (name, setup) in [("netflow", netflow::setup as Setup), ("ipfix", ipfix::setup), ("sflow", sflow::setup)] {
+            let mut started = true;
+            let logged = crate::log::capture(|| started = setup(&Properties::new(), &kafka, ctx()));
+            assert!(!started, "{name}");
+            assert_eq!(logged, [format!("Parser {name} does not support connector kafka")]);
+        }
+
+        // The text parser takes kafka; without properties the connector does not start.
+        let props: Properties = [("src_ip", "1"), ("dst_ip", "2"), ("dst_port", "3"), ("protocol", "4")]
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect();
+        let text = crate::parsers::text::TextParser::new(crate::parsers::text::configure(&props).ok().unwrap(), ctx());
+        let spy = Arc::new(Spy { inner: Arc::new(text), started: Default::default() });
+        assert!(spy.supports_connector("kafka"));
+        let mut started = true;
+        let logged = crate::log::capture(|| started = start_connector(spy.clone(), "kafka", &Properties::new()));
+        assert!(!started);
+        assert_eq!(spy.started.load(std::sync::atomic::Ordering::SeqCst), 0, "no worker or consumer thread");
+        assert_eq!(
+            logged,
+            [
+                "Error: invalid version ``",
+                "Missing kafka property: brokers",
+                "Missing kafka property: version",
+                "Missing kafka property: group",
+                "Missing kafka property: topics",
+            ]
+        );
     }
 
     #[test]

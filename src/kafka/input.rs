@@ -1,12 +1,21 @@
-//! Kafka input connector (`connectors: - type: kafka`): its properties and TLS material.
-//!
-//! Only parsing and validation live here; nothing connects.
+//! Kafka input connector (`connectors: - type: kafka`, text parser only): its properties and TLS
+//! material, and the consumer threads that hand each message to the parser as one datagram.
 
 use std::fmt;
+use std::sync::Arc;
+use std::thread;
+use std::time::{Duration, Instant};
+
+use crossbeam_channel::Sender;
 
 use crate::config::Properties;
+use crate::kafka::group::{GroupConsumer, GroupSettings, InMessage, Member};
 use crate::kafka::producer::split_brokers;
 use crate::kafka::tls;
+use crate::metrics::{get_or_register_meter, Meter};
+use crate::parsers::{Parser, ReceivedDatagram};
+use crate::stats::ThreadGuard;
+use crate::{debug_log, log_line};
 
 /// Client id when `client_id` is not set.
 pub const DEFAULT_CLIENT_ID: &str = "Illumio-flowlink";
@@ -186,9 +195,183 @@ fn tls_pem(props: &Properties, read: &dyn Fn(&str) -> String) -> Result<Option<T
     Ok(Some(TlsPem { client, roots_pem: tls::system_roots_pem() }))
 }
 
+/// How long one poll waits; also how soon an idle consumer notices shutdown.
+const POLL_WAIT: Duration = Duration::from_secs(1);
+
+/// Starts the consumer threads of one Kafka connector entry; false when it does not start.
+pub fn start(parser: Arc<dyn Parser>, props: &Properties) -> bool {
+    let s = match parse_settings(props, &crate::secrets::key_source) {
+        Ok(s) => s,
+        Err(InputError::Invalid(lines)) => {
+            lines.iter().for_each(|l| log_line!(l));
+            return false;
+        }
+        Err(InputError::Exit(lines)) => {
+            lines.iter().for_each(|l| log_line!(l));
+            std::process::exit(1);
+        }
+    };
+    // As in FlowLink: one parser channel for all instances, 10 workers per instance.
+    let ch = parser.start_workers(10 * s.instances);
+    // Shared by all Kafka connectors; the consumer's own meter is marked by the parser.
+    let kafka_meter = get_or_register_meter("kafka");
+    for i in 0..s.instances {
+        let group = GroupSettings::for_instance(&s, i);
+        let inst = Instance { client_id: group.client_id.clone(), brokers_raw: s.brokers_raw.clone(), device_addr: s.device_addr.clone() };
+        let (ch, kafka_meter) = (ch.clone(), kafka_meter.clone());
+        // A std thread of its own: `GroupConsumer` blocks on the shared Kafka runtime, which must
+        // not happen on one of the runtime's workers.
+        thread::spawn(move || {
+            let _guard = ThreadGuard::core("kafka consumer");
+            let mut connect = || GroupConsumer::connect(&group).map(|g| Box::new(g) as Box<dyn Member>);
+            run_instance(&mut connect, &ch, &inst, &kafka_meter, &crate::log::shutdown, Timing::FLOWLINK);
+        });
+    }
+    true
+}
+
+/// What one consumer instance logs and stamps on its datagrams.
+#[derive(Debug, Clone)]
+pub(crate) struct Instance {
+    pub client_id: String,
+    /// `brokers` as configured, for the log lines.
+    pub brokers_raw: String,
+    pub device_addr: String,
+}
+
+/// Connection retry timing.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Timing {
+    /// The wait between two connection attempts.
+    pub retry: Duration,
+    /// After failing this long the process exits 1.
+    pub give_up: Duration,
+}
+
+impl Timing {
+    pub const FLOWLINK: Timing = Timing { retry: Duration::from_secs(60), give_up: Duration::from_secs(20 * 60) };
+}
+
+/// True once connecting has failed for `limit`; checked after a failure, before the wait.
+pub(crate) fn give_up(elapsed: Duration, limit: Duration) -> bool {
+    elapsed >= limit
+}
+
+/// One consumer instance until shutdown: connect (with retry), consume, and on a client error close
+/// the member and connect again.
+pub(crate) fn run_instance(
+    connect: &mut dyn FnMut() -> Result<Box<dyn Member>, String>,
+    ch: &Sender<ReceivedDatagram>,
+    inst: &Instance,
+    kafka_meter: &Meter,
+    stop: &dyn Fn() -> bool,
+    timing: Timing,
+) {
+    while !stop() {
+        let start = Instant::now();
+        let Some(mut member) = connect_with_retry(connect, &inst.brokers_raw, stop, &mut thread::sleep, &|| start.elapsed(), timing)
+        else {
+            break;
+        };
+        log_line!("Client:", inst.client_id, "connected to kafka brokers:", inst.brokers_raw);
+        let result = consume(member.as_mut(), ch, &inst.device_addr, &inst.client_id, kafka_meter, stop);
+        // Commits the marks and leaves the group. Fix: FlowLink never closes its consumer group,
+        // and leaks one on every client error.
+        member.close();
+        match result {
+            Err(e) => log_line!("Client error:", e),
+            Ok(()) => break,
+        }
+    }
+    log_line!("kafka exiting");
+}
+
+/// Calls `connect` until it succeeds, logging each error and waiting `timing.retry` (in 1 s steps)
+/// between attempts. `None` once `stop()`; exits 1 when the attempts have failed for
+/// `timing.give_up`.
+pub(crate) fn connect_with_retry<C>(
+    connect: &mut dyn FnMut() -> Result<C, String>,
+    brokers_raw: &str,
+    stop: &dyn Fn() -> bool,
+    sleep: &mut dyn FnMut(Duration),
+    elapsed: &dyn Fn() -> Duration,
+    timing: Timing,
+) -> Option<C> {
+    const STEP: Duration = Duration::from_secs(1);
+    loop {
+        if stop() {
+            return None;
+        }
+        match connect() {
+            Ok(c) => return Some(c),
+            Err(e) => log_line!(e),
+        }
+        if give_up(elapsed(), timing.give_up) {
+            log_line!("Unable to connect to kafka brokers:", brokers_raw, "for 20 minutes. Exiting.");
+            std::process::exit(1);
+        }
+        // Divergence: FlowLink sleeps the whole minute without looking at the shutdown flag.
+        let mut left = timing.retry;
+        while !left.is_zero() {
+            if stop() {
+                return None;
+            }
+            let step = left.min(STEP);
+            sleep(step);
+            left -= step;
+        }
+    }
+}
+
+/// Polls `member` and hands every message to the parser until `stop()` (Ok) or a poll error (Err).
+/// Ok as well when the parser channel is closed.
+pub(crate) fn consume(
+    member: &mut dyn Member,
+    ch: &Sender<ReceivedDatagram>,
+    device_addr: &str,
+    client_id: &str,
+    kafka_meter: &Meter,
+    stop: &dyn Fn() -> bool,
+) -> Result<(), String> {
+    while !stop() {
+        // Every message of a poll is handed over and marked before the next poll.
+        for m in member.poll(POLL_WAIT)? {
+            // Fix: FlowLink drops the message it receives at shutdown; here it is handed over. The
+            // parsers drain the channel before the process exits.
+            debug_log!(
+                client_id,
+                ": Message claimed: value: '",
+                String::from_utf8_lossy(&m.value),
+                "', timestamp:",
+                m.timestamp.map(|t| t.to_rfc3339()).unwrap_or_default(),
+                ", topic:",
+                m.topic
+            );
+            // Blocks while the parser channel is full. A member blocked here for longer than the
+            // group's rebalance timeout (60 s) loses its partitions; the messages it has not marked
+            // yet are delivered again (at-least-once).
+            if ch.send(to_datagram(&m, device_addr)).is_err() {
+                return Ok(());
+            }
+            // Marked only once the parser has it (at-least-once), as in FlowLink.
+            member.mark(&m);
+            kafka_meter.mark(1);
+        }
+    }
+    Ok(())
+}
+
+/// One message as one text datagram: the first configured broker as device address, no sequence
+/// id, the whole value.
+pub(crate) fn to_datagram(m: &InMessage, device_addr: &str) -> ReceivedDatagram {
+    // Divergence: FlowLink truncates the value at 65 536 bytes without notice; it is passed whole.
+    ReceivedDatagram { device_addr: device_addr.to_string(), seq_id: String::new(), transport: "kafka".into(), buf: m.value.clone() }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crossbeam_channel::Receiver;
 
     const CERT: &str = include_str!("../../tests/fixtures/kafka/client.pem");
     const KEY: &str = include_str!("../../tests/fixtures/kafka/client.key");
@@ -354,6 +537,208 @@ mod tests {
         assert!(!format!("{s:?}").contains(key_body));
         assert!(format!("{s:?}").contains("TlsPem"));
         assert!(logged.iter().all(|l| !l.contains(key_body)), "{logged:?}");
+    }
+
+    // ---- run loop ----
+
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+
+    fn msg(offset: i64, value: &str) -> InMessage {
+        InMessage { topic: "t".into(), partition: 0, offset, timestamp: None, value: value.into() }
+    }
+
+    #[derive(Default)]
+    struct Seen {
+        polls: usize,
+        /// (offset, datagrams in the channel when the message was marked)
+        marked: Vec<(i64, usize)>,
+        closed: usize,
+    }
+
+    /// Hands out `batches`, then empty polls (sleeping the poll's wait when `idle`).
+    struct FakeMember {
+        batches: VecDeque<Result<Vec<InMessage>, String>>,
+        idle: bool,
+        seen: Arc<Mutex<Seen>>,
+        rx: Receiver<ReceivedDatagram>,
+    }
+
+    impl Member for FakeMember {
+        fn poll(&mut self, d: Duration) -> Result<Vec<InMessage>, String> {
+            self.seen.lock().unwrap().polls += 1;
+            match self.batches.pop_front() {
+                Some(b) => b,
+                None => {
+                    if self.idle {
+                        std::thread::sleep(d);
+                    }
+                    Ok(vec![])
+                }
+            }
+        }
+
+        fn mark(&mut self, m: &InMessage) {
+            self.seen.lock().unwrap().marked.push((m.offset, self.rx.len()));
+        }
+
+        fn close(self: Box<Self>) {
+            self.seen.lock().unwrap().closed += 1;
+        }
+    }
+
+    fn instance() -> Instance {
+        Instance { client_id: "c".into(), brokers_raw: "k1:9092,k2:9092".into(), device_addr: "k1:9092".into() }
+    }
+
+    #[test]
+    fn message_becomes_one_datagram() {
+        let m = InMessage { topic: "t".into(), partition: 0, offset: 5, timestamp: None, value: vec![b'x'; 70_000] };
+        let d = to_datagram(&m, "k1:9092");
+        assert_eq!((d.device_addr.as_str(), d.transport.as_str(), d.seq_id.as_str(), d.buf.len()), ("k1:9092", "kafka", "", 70_000));
+        assert_eq!(d.buf, m.value);
+    }
+
+    #[test]
+    fn connect_retries_every_60s_and_exits_after_20min() {
+        // Fails three times, then connects: three 60 s waits, in 1 s steps.
+        let clock = std::cell::Cell::new(Duration::ZERO);
+        let mut sleeps = Vec::new();
+        let mut attempts = 0;
+        let mut connect = || {
+            attempts += 1;
+            if attempts <= 3 { Err(format!("no broker {attempts}")) } else { Ok(42) }
+        };
+        let mut r = None;
+        let logged = crate::log::capture(|| {
+            r = connect_with_retry(
+                &mut connect,
+                "k1:9092",
+                &|| false,
+                &mut |d| {
+                    sleeps.push(d);
+                    clock.set(clock.get() + d);
+                },
+                &|| clock.get(),
+                Timing::FLOWLINK,
+            )
+        });
+        assert_eq!(r, Some(42));
+        assert_eq!(logged, ["no broker 1", "no broker 2", "no broker 3"]);
+        assert_eq!(sleeps.len(), 180);
+        assert!(sleeps.iter().all(|d| *d == Duration::from_secs(1)));
+        assert_eq!(clock.get(), Duration::from_secs(180));
+
+        // Stop during the second wait: no further attempt, None.
+        let clock = std::cell::Cell::new(Duration::ZERO);
+        let mut attempts = 0;
+        let r: Option<()> = connect_with_retry(
+            &mut || {
+                attempts += 1;
+                Err("down".into())
+            },
+            "k1:9092",
+            &|| clock.get() >= Duration::from_secs(90),
+            &mut |d| clock.set(clock.get() + d),
+            &|| clock.get(),
+            Timing::FLOWLINK,
+        );
+        assert_eq!(r, None);
+        assert_eq!(attempts, 2);
+        assert_eq!(clock.get(), Duration::from_secs(90));
+
+        // The give-up check: FlowLink's values, at or after the limit.
+        assert_eq!((Timing::FLOWLINK.retry, Timing::FLOWLINK.give_up), (Duration::from_secs(60), Duration::from_secs(1200)));
+        assert!(!give_up(Duration::from_secs(19 * 60 + 59), Timing::FLOWLINK.give_up));
+        assert!(give_up(Duration::from_secs(20 * 60), Timing::FLOWLINK.give_up));
+        assert!(give_up(Duration::from_secs(21 * 60), Timing::FLOWLINK.give_up));
+    }
+
+    #[test]
+    fn consume_marks_after_handoff_and_counts_meter() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let mut m = FakeMember {
+            batches: VecDeque::from([Ok(vec![msg(0, "a b"), msg(1, "c d")])]),
+            idle: false,
+            seen: seen.clone(),
+            rx: rx.clone(),
+        };
+        let meter = Meter::new();
+        let stop = || seen.lock().unwrap().polls >= 2;
+        assert_eq!(consume(&mut m, &tx, "k1:9092", "c", &meter, &stop), Ok(()));
+        let got: Vec<ReceivedDatagram> = rx.try_iter().collect();
+        assert_eq!(got.len(), 2);
+        assert_eq!((got[0].buf.as_slice(), got[1].buf.as_slice()), (&b"a b"[..], &b"c d"[..]));
+        assert!(got.iter().all(|d| d.device_addr == "k1:9092" && d.transport == "kafka"));
+        // Each message is marked only once it is in the channel.
+        assert_eq!(seen.lock().unwrap().marked, [(0, 1), (1, 2)]);
+        assert_eq!(meter.count(), 2);
+        assert_eq!(seen.lock().unwrap().closed, 0, "consume does not close");
+    }
+
+    #[test]
+    fn consume_returns_poll_error() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let mut m = FakeMember { batches: VecDeque::from([Err("boom".to_string())]), idle: false, seen, rx };
+        assert_eq!(consume(&mut m, &tx, "k1:9092", "c", &Meter::new(), &|| false), Err("boom".to_string()));
+    }
+
+    #[test]
+    fn idle_consumer_stops_on_shutdown() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let mut connects = 0;
+        let mut connect = || -> Result<Box<dyn Member>, String> {
+            connects += 1;
+            Ok(Box::new(FakeMember { batches: VecDeque::new(), idle: true, seen: seen.clone(), rx: rx.clone() }))
+        };
+        let start = Instant::now();
+        let stop = || start.elapsed() >= Duration::from_millis(1500);
+        let logged = crate::log::capture(|| run_instance(&mut connect, &tx, &instance(), &Meter::new(), &stop, Timing::FLOWLINK));
+        let took = start.elapsed();
+        assert!(took >= Duration::from_millis(1500) && took < Duration::from_secs(3), "{took:?}");
+        assert_eq!(connects, 1);
+        let seen = seen.lock().unwrap();
+        assert_eq!(seen.closed, 1);
+        assert!(seen.polls >= 2, "{}", seen.polls);
+        assert_eq!(logged, ["Client: c connected to kafka brokers: k1:9092,k2:9092", "kafka exiting"]);
+    }
+
+    #[test]
+    fn poll_error_closes_member_and_reconnects() {
+        let (tx, rx) = crossbeam_channel::unbounded();
+        let seen = Arc::new(Mutex::new(Seen::default()));
+        let mut connects = 0;
+        let mut connect = || -> Result<Box<dyn Member>, String> {
+            connects += 1;
+            let batches = if connects == 1 { VecDeque::from([Err("broker gone".to_string())]) } else { VecDeque::new() };
+            Ok(Box::new(FakeMember { batches, idle: false, seen: seen.clone(), rx: rx.clone() }))
+        };
+        // Stops at the second member's first (empty) poll.
+        let stop = || seen.lock().unwrap().polls >= 2;
+        let logged = crate::log::capture(|| run_instance(&mut connect, &tx, &instance(), &Meter::new(), &stop, Timing::FLOWLINK));
+        assert_eq!(connects, 2);
+        assert_eq!(seen.lock().unwrap().closed, 2, "the failed member is closed before reconnecting");
+        assert_eq!(
+            logged,
+            [
+                "Client: c connected to kafka brokers: k1:9092,k2:9092",
+                "Client error: broker gone",
+                "Client: c connected to kafka brokers: k1:9092,k2:9092",
+                "kafka exiting",
+            ]
+        );
+    }
+
+    #[test]
+    fn stop_before_connect_logs_kafka_exiting() {
+        let (tx, _rx) = crossbeam_channel::unbounded();
+        let mut connect = || -> Result<Box<dyn Member>, String> { panic!("no connect after stop") };
+        let logged = crate::log::capture(|| run_instance(&mut connect, &tx, &instance(), &Meter::new(), &|| true, Timing::FLOWLINK));
+        assert_eq!(logged, ["kafka exiting"]);
     }
 
     #[test]

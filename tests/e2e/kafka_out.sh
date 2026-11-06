@@ -9,7 +9,7 @@
 #       FlowPilot only (CI): the gateway answers 404, the settings come from the kafka_info file.
 # CERTS is the broker's certificate directory (connection_string); TOOL is the kafka_tool example.
 # The connection string never appears in an argv or on stdout. $FLOWLINK_GW is never printed: FlowLink's
-# log is redacted as soon as FlowLink has exited.
+# log is redacted as soon as FlowLink has exited, and again from the EXIT trap on every other way out.
 set -euo pipefail
 MODE=$1 CERTS=$2 TOOL=$3 OUT=$4 RUST=$5
 HERE=$(cd "$(dirname "$0")" && pwd)
@@ -106,14 +106,44 @@ wait_for() {
   return 1
 }
 
-# PID: wait up to 60 s for it to exit; its exit status goes to $REAPED (not a subshell: wait needs the parent).
+# PID: wait up to 60 s for it to exit, then kill it (status 137); its exit status goes to $REAPED (not a
+# subshell: wait needs the parent).
 reap() {
   for _ in $(seq 60); do kill -0 "$1" 2>/dev/null || break; sleep 1; done
+  if kill -0 "$1" 2>/dev/null; then
+    kill -KILL "$1" 2>/dev/null || true
+    wait "$1" 2>/dev/null || true
+    REAPED=137
+    return
+  fi
   REAPED=0; wait "$1" || REAPED=$?
 }
 
 # Neither the log nor anything else FlowPilot wrote there holds the connection string.
 no_secret() { ! grep -rqF -f "$CS" "$1"; }
+
+# The last 20 lines of a FlowPilot log, only once it is known not to hold the connection string.
+show_tail() {
+  if no_secret "$1"; then tail -20 "$1"; else echo "($1 withheld: it contains the connection string)"; fi
+}
+
+# FlowLink's log may name its built-in gateway (e.g. in a request error): stop FlowLink if it still runs,
+# then replace the name. Idempotent; runs on the normal path and from the EXIT trap.
+ORIG_PID=
+redact_flowlink() {
+  [ -n "${FLOWLINK_GW:-}" ] && [ -f "$OUT/orig/flowlink.log" ] || return 0
+  if [ -n "$ORIG_PID" ] && kill -0 "$ORIG_PID" 2>/dev/null; then
+    kill -KILL "$ORIG_PID" 2>/dev/null || true
+    wait "$ORIG_PID" 2>/dev/null || true
+  fi
+  python3 - "$OUT/orig/flowlink.log" <<'PY'
+import os, sys
+p, gw = sys.argv[1], os.environ["FLOWLINK_GW"].encode()
+data = open(p, "rb").read()
+open(p, "wb").write(data.replace(gw, b"<flowlink-gateway>"))
+PY
+}
+trap redact_flowlink EXIT
 
 dump() { "$TOOL" dump --brokers kafka:9093 --topic "$1" --out "$2" --sasl-password-file "$CS" --insecure; }
 
@@ -137,9 +167,9 @@ scenario_out() {
   python3 "$HERE/udp_fanout.py" 2055:12055,22055 4739:14739,24739 6514:16514,26514 &
   sleep 1
 
-  (cd orig && CONFIG_FILE=$OUT/orig/config.yaml TZ=UTC exec "$ORIG" "" >flowlink.log 2>&1) & local ORIG_PID=$!
+  (cd orig && CONFIG_FILE=$OUT/orig/config.yaml TZ=UTC exec "$ORIG" "" >flowlink.log 2>&1) & ORIG_PID=$!
   (cd rust && CONFIG_FILE=$OUT/rust/config.yaml TZ=UTC exec "$RUST" "" >flowlink.log 2>&1) & local RUST_PID=$!
-  wait_for rust/flowlink.log "KafkaProducer setup" 60 || { tail -20 rust/flowlink.log; fail "FlowPilot producer setup"; }
+  wait_for rust/flowlink.log "KafkaProducer setup" 60 || { show_tail rust/flowlink.log; fail "FlowPilot producer setup"; }
   wait_for orig/flowlink.log "KafkaProducer setup" 120 || fail "FlowLink producer setup"
   sleep 2
 
@@ -154,13 +184,7 @@ scenario_out() {
   local orig_st rust_st
   reap $ORIG_PID; orig_st=$REAPED
   reap $RUST_PID; rust_st=$REAPED
-  # FlowLink's log may name its built-in gateway (e.g. in a request error): redact it before anything reads it.
-  python3 - orig/flowlink.log <<'PY'
-import os, sys
-p, gw = sys.argv[1], os.environ["FLOWLINK_GW"].encode()
-data = open(p, "rb").read()
-open(p, "wb").write(data.replace(gw, b"<flowlink-gateway>"))
-PY
+  redact_flowlink
   echo "exit status: original=$orig_st flowpilot=$rust_st"
   check "FlowPilot exits 0 after the signal" [ "$rust_st" = 0 ]
 
@@ -232,11 +256,11 @@ stats:
 YAML
 )"
   (cd rust && CONFIG_FILE=$OUT/rust/config.yaml TZ=UTC exec "$RUST" "" >flowpilot.log 2>&1) & local PID=$!
-  wait_for rust/flowpilot.log "KafkaProducer setup" 60 || { tail -20 rust/flowpilot.log; fail "producer setup"; exit 1; }
+  wait_for rust/flowpilot.log "KafkaProducer setup" 60 || { show_tail rust/flowpilot.log; fail "producer setup"; exit 1; }
   sleep 1
   send_syslog 6514
   # The first window closes 5 minutes after the start; then one stats line that has counted the upload.
-  wait_for rust/flowpilot.log "Sent kafka message to partition:" 420 || { tail -20 rust/flowpilot.log; fail "no Kafka message sent"; }
+  wait_for rust/flowpilot.log "Sent kafka message to partition:" 420 || { show_tail rust/flowpilot.log; fail "no Kafka message sent"; }
   local n
   n=$(grep -c FLOWPILOT_STATS rust/flowpilot.log || true)
   for _ in $(seq 30); do [ "$(grep -c FLOWPILOT_STATS rust/flowpilot.log || true)" -gt "$n" ] && break; sleep 1; done

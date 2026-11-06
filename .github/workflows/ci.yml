@@ -55,6 +55,7 @@ jobs:
     # PCE Kafka mode against the test broker: the producer and consumer-group tests, then the FlowPilot-only
     # end-to-end scenario (the FlowLink differential is local only).
     runs-on: ubuntu-latest
+    timeout-minutes: 25
     steps:
       - uses: actions/checkout@v5
       - uses: dtolnay/rust-toolchain@stable

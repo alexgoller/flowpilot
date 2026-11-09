@@ -4,7 +4,12 @@
 use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
-use std::process::{Command, Stdio};
+use std::process::{Command, Output, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+/// How long `api_secret_command` (and an `api_key` source re-read after a 401) may run.
+pub const COMMAND_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// `$cmd args` runs a command (no shell), anything else reads a file.
 pub fn key_source(s: &str) -> String {
@@ -25,10 +30,12 @@ pub(crate) enum Failure {
     Read { err: String, path: String },
     /// A single `log_line` line.
     Message(&'static str),
+    /// A command that ran longer than its limit and was killed: `Command timed out after <n> seconds: <program>`.
+    Timeout { program: String, after: Duration },
 }
 
 impl Failure {
-    fn exit(self) -> ! {
+    pub(crate) fn exit(self) -> ! {
         match self {
             // As in FlowLink, stderr (not the error) is logged, verbatim incl. its trailing newline.
             Failure::Command(stderr) => crate::log_line!("Command failed:", stderr),
@@ -38,21 +45,52 @@ impl Failure {
                 crate::log_line!("Error reading file:", path);
             }
             Failure::Message(m) => crate::log_line!(m),
+            t @ Failure::Timeout { .. } => t.report(),
         }
         std::process::exit(1)
+    }
+
+    /// Logs the failure without exiting (a re-read at run time). Same texts; never the command's output.
+    pub(crate) fn report(self) {
+        match self {
+            Failure::Command(stderr) => crate::log_line!("Command failed:", stderr),
+            Failure::Read { err, path } => {
+                crate::log_line!("Error:", err);
+                crate::log_line!("Error reading file:", path);
+            }
+            Failure::Message(m) => crate::log_line!(m),
+            Failure::Timeout { program, after } => {
+                crate::log_line!(format!("Command timed out after {} seconds: {program}", after.as_secs_f64()))
+            }
+        }
     }
 }
 
 /// The value of an `api_key`-style source: `$command` output or file contents.
 pub(crate) fn read_key_source(s: &str) -> Result<String, Failure> {
+    read_key_source_within(s, None)
+}
+
+/// `read_key_source`; a `$command` is killed after `timeout` when one is given.
+fn read_key_source_within(s: &str, timeout: Option<Duration>) -> Result<String, Failure> {
     match s.strip_prefix('$') {
-        Some(cmd) => run_command(cmd),
+        Some(cmd) => run_command(cmd, timeout),
         None => read_key_file(s),
     }
 }
 
-/// Runs a `$command`: whitespace split, PATH lookup, stdin /dev/null, trimmed stdout.
-fn run_command(cmdline: &str) -> Result<String, Failure> {
+/// `api_secret_command`: the command line itself (no leading `$`), run like a `$command` but killed after `timeout`.
+/// Its output is the secret: one word, nothing else.
+pub(crate) fn secret_command(cmdline: &str, timeout: Duration) -> Result<String, Failure> {
+    let secret = run_command(cmdline, Some(timeout))?;
+    if secret.is_empty() || secret.contains(char::is_whitespace) {
+        return Err(Failure::Message("API secret command printed no usable secret"));
+    }
+    Ok(secret)
+}
+
+/// Runs a `$command`: whitespace split, PATH lookup, stdin /dev/null, trimmed stdout; killed after `timeout`.
+fn run_command(cmdline: &str, timeout: Option<Duration>) -> Result<String, Failure> {
     let f: Vec<&str> = cmdline.split_whitespace().collect();
     // Divergence: FlowLink panics (exit 2) on an empty command; we log `Command failed: ` and exit 1.
     let Some((name, args)) = f.split_first() else {
@@ -60,18 +98,75 @@ fn run_command(cmdline: &str) -> Result<String, Failure> {
     };
     // A lookup or start failure has no stderr: `Command failed: `.
     let path = look_path(name).ok_or_else(|| Failure::Command(String::new()))?;
-    let out = Command::new(path)
-        .arg0(name)
-        .args(args)
-        .stdin(Stdio::null())
-        .output()
-        .map_err(|_| Failure::Command(String::new()))?;
+    let mut cmd = Command::new(path);
+    cmd.arg0(name).args(args).stdin(Stdio::null());
+    let out = match timeout {
+        None => cmd.output().map_err(|_| Failure::Command(String::new()))?,
+        Some(limit) => output_within(cmd, limit).map_err(|f| match f {
+            Failure::Timeout { after, .. } => Failure::Timeout { program: name.to_string(), after },
+            f => f,
+        })?,
+    };
     if !out.status.success() {
         return Err(Failure::Command(
             String::from_utf8_lossy(&out.stderr).into_owned(),
         ));
     }
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
+/// `Command::output` with a limit. The command runs in its own process group, so killing the group at the limit
+/// also stops whatever it started (a script's `sleep`, say) and nothing keeps its pipes open.
+fn output_within(mut cmd: Command, limit: Duration) -> Result<Output, Failure> {
+    let deadline = Instant::now() + limit;
+    let timed_out = || Failure::Timeout { program: String::new(), after: limit };
+    let mut child = cmd
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .process_group(0)
+        .spawn()
+        .map_err(|_| Failure::Command(String::new()))?;
+    let kill = |child: &mut std::process::Child| {
+        // SAFETY: plain syscall; the group id is the child's pid (`process_group(0)`).
+        unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+        let _ = child.kill();
+        let _ = child.wait();
+    };
+    let reader = |mut r: Box<dyn Read + Send>| {
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            let mut b = Vec::new();
+            let _ = r.read_to_end(&mut b);
+            let _ = tx.send(b);
+        });
+        rx
+    };
+    let stdout = reader(Box::new(child.stdout.take().expect("piped stdout")));
+    let stderr = reader(Box::new(child.stderr.take().expect("piped stderr")));
+    let status = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break status,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            Ok(None) => {
+                kill(&mut child);
+                return Err(timed_out());
+            }
+            Err(_) => {
+                kill(&mut child);
+                return Err(Failure::Command(String::new()));
+            }
+        }
+    };
+    // Something the command left running may still hold the pipes: the limit covers them too.
+    let collect = |rx: mpsc::Receiver<Vec<u8>>| rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
+    match (collect(stdout), collect(stderr)) {
+        (Ok(stdout), Ok(stderr)) => Ok(Output { status, stdout, stderr }),
+        _ => {
+            // SAFETY: as above; the group may outlive its leader.
+            unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
+            Err(timed_out())
+        }
+    }
 }
 
 /// Go `exec.LookPath`: names containing `/` are used as is; otherwise search `$PATH` (empty
@@ -107,6 +202,12 @@ fn read_key_file(path: &str) -> Result<String, Failure> {
 
 /// API key handling.
 pub(crate) fn credentials(api_key: &str) -> Result<(String, String), Failure> {
+    credentials_within(api_key, None)
+}
+
+/// `credentials`; a `$command` is killed after `timeout` when one is given.
+pub(crate) fn credentials_within(api_key: &str, timeout: Option<Duration>) -> Result<(String, String), Failure> {
+    let read_key_source = |s: &str| read_key_source_within(s, timeout);
     let key = read_key_source(api_key)?;
     if key.contains("key_id") {
         // As in FlowLink: substring detection; user = auth_username, token = secret.

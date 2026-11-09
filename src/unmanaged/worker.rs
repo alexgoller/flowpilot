@@ -14,6 +14,7 @@ use super::pce::{HttpPce, PceApi};
 use super::state::StateFiles;
 use crate::aggregator::WindowReport;
 use crate::config::Config;
+use crate::credentials::Credentials;
 use crate::stats::UnmanagedStats;
 use crate::uploader::PceTarget;
 use crate::{log_line, secrets};
@@ -98,8 +99,8 @@ fn now() -> i64 {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs() as i64)
 }
 
-/// Starts the worker when the feature is enabled. `target` holds the upload credentials (the direct
-/// `FLOWPILOT_API_USER`/`_SECRET` ones when set, see `Config::credentials`), used unless
+/// Starts the worker when the feature is enabled. `target` holds the upload credentials (shared, read again after a
+/// 401, see `Config::credentials`), used unless
 /// `unmanaged_workloads.api_key` overrides them (resolved here, so a bad key exits at startup like the main one).
 /// A PCE client that cannot be built disables the feature but never the flow pipeline. Returns the worker and the
 /// engine's counters.
@@ -110,7 +111,9 @@ pub fn start(cfg: &Config, target: &PceTarget, dir: &Path) -> Option<(Handle, Ar
     }
     let mut target = target.clone();
     if let Some(key) = &uw.api_key {
-        (target.api_user, target.api_token) = secrets::api_credentials(key);
+        // The override is read once and never again.
+        let (user, token) = secrets::api_credentials(key);
+        target.credentials = Credentials::fixed(user, token);
     }
     let networks: Vec<String> = uw.networks.iter().map(ToString::to_string).collect();
     log_line!(format!("Unmanaged workloads enabled (dry run: {}), networks {}", uw.dry_run, networks.join(",")));

@@ -3,6 +3,7 @@
 
 use std::fmt;
 
+use crate::credentials::Credentials;
 use crate::install::answers::{Answers, Proxy};
 use crate::stats::redact_userinfo;
 use crate::uploader::PceTarget;
@@ -67,8 +68,7 @@ pub(crate) fn check_with(a: &Answers, build: impl FnOnce(&PceTarget) -> reqwest:
     let target = PceTarget {
         pce_addr: a.pce_addr.clone(),
         org_id: a.org_id,
-        api_user: a.api_user.clone(),
-        api_token: a.api_secret.0.clone(),
+        credentials: Credentials::fixed(a.api_user.clone(), a.api_secret.0.clone()),
         verify_cert: a.verify_pce_cert,
     };
     // An error text can name the proxy, user and password included.

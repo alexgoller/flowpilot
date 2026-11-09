@@ -9,6 +9,7 @@ use std::time::Duration;
 use reqwest::blocking::Client;
 use reqwest::header::{CONNECTION, CONTENT_ENCODING, CONTENT_TYPE};
 
+use crate::credentials::Credentials;
 use crate::log::shutdown;
 use crate::log_line;
 use crate::spool::{SpoolFile, Spool, MAX_SENDERS};
@@ -30,8 +31,8 @@ pub trait MessageSink: Send + Sync {
 pub struct PceTarget {
     pub pce_addr: String,
     pub org_id: i32,
-    pub api_user: String,
-    pub api_token: String,
+    /// Shared with the other users of the PCE API; read again after a 401.
+    pub credentials: Arc<Credentials>,
     pub verify_cert: bool,
 }
 
@@ -180,15 +181,17 @@ impl Uploader {
         }
     }
 
-    /// One POST, including the immediate re-POST after the `/flowlink` 404 fallback.
-    /// `map_url` exists for tests (plain-HTTP server).
+    /// One POST, including the immediate re-POST after the `/flowlink` 404 fallback, and after a 401 that made the
+    /// credentials change. `map_url` exists for tests (plain-HTTP server).
     fn post(&self, client: &Client, fd: &SpoolFile, data: &[u8], map_url: fn(String) -> String) -> Outcome {
+        let mut reread = false;
         loop {
             let target = self.target();
             let url = target.url(self.legacy_url.load(Ordering::SeqCst));
+            let (user, token) = target.credentials.current();
             let resp = client
                 .post(map_url(url.clone()))
-                .basic_auth(&target.api_user, Some(&target.api_token))
+                .basic_auth(&user, Some(&token))
                 .header(CONTENT_TYPE, "application/x-protobuf")
                 .header(CONTENT_ENCODING, "gzip")
                 .header(CONNECTION, "close")
@@ -222,6 +225,17 @@ impl Uploader {
                     self.spool.delete(fd);
                     return Outcome::Done;
                 }
+                // FlowPilot extension: the secret may have been rotated. Once per file, at once when it changed.
+                401 => {
+                    failed();
+                    if let Ok(body) = resp.text() {
+                        log_line!("Response body:", body);
+                    }
+                    if reread || !target.credentials.refresh(&token) {
+                        return Outcome::Retry;
+                    }
+                    reread = true;
+                }
                 _ => {
                     failed();
                     if let Ok(body) = resp.text() {
@@ -253,7 +267,7 @@ mod tests {
 
     #[test]
     fn url_format_and_fallback() {
-        let target = PceTarget { pce_addr: "pce.example.com:8443".into(), org_id: 3, api_user: "u".into(), api_token: "t".into(), verify_cert: true };
+        let target = PceTarget { pce_addr: "pce.example.com:8443".into(), org_id: 3, credentials: Credentials::fixed("u", "t"), verify_cert: true };
         assert_eq!(target.url(false), "https://pce.example.com:8443/api/v2/orgs/3/traffic_data/flowlink");
         assert_eq!(target.url(true), "https://pce.example.com:8443/api/v2/orgs/3/traffic_data");
     }
@@ -296,7 +310,7 @@ mod tests {
         let spool = Arc::new(Spool::new(dir.path().to_path_buf(), 24, 500));
         spool.add(b"gzdata", 7, false);
         let fd = spool.get();
-        let up = Uploader::new(spool.clone(), PceTarget { pce_addr: addr, org_id: 1, api_user: "api_1".into(), api_token: "secret".into(), verify_cert: true });
+        let up = Uploader::new(spool.clone(), PceTarget { pce_addr: addr, org_id: 1, credentials: Credentials::fixed("api_1", "secret"), verify_cert: true });
         let client = Client::builder().http1_only().build().unwrap();
         let outcome = up.post(&client, &fd, b"gzdata", |u| u.replacen("https://", "http://", 1));
         assert_eq!(outcome, Outcome::Done);
@@ -320,7 +334,7 @@ mod tests {
         let spool = Arc::new(Spool::new(dir.path().to_path_buf(), 24, 500).with_stats(st));
         spool.add(b"gzdata", 7, false);
         let fd = spool.get();
-        let target = PceTarget { pce_addr: addr, org_id: 1, api_user: "api_1".into(), api_token: "secret".into(), verify_cert: true };
+        let target = PceTarget { pce_addr: addr, org_id: 1, credentials: Credentials::fixed("api_1", "secret"), verify_cert: true };
         (Uploader::new(spool, target), fd, st, dir)
     }
 
@@ -359,6 +373,86 @@ mod tests {
         assert!(s.first_failure_since_success_at.is_none() && s.last_error.is_some());
     }
 
+    /// A key file holding `api_1 secret`, read again at every 401.
+    fn rotating_key(dir: &tempfile::TempDir) -> (std::path::PathBuf, Arc<Credentials>) {
+        use crate::credentials::Origin;
+        let key = dir.path().join("api_info");
+        std::fs::write(&key, "api_1 secret\n").unwrap();
+        let origin = Origin::ApiKey(key.to_str().unwrap().into());
+        (key, Credentials::load_with(origin, Duration::ZERO, Duration::from_secs(5)).unwrap())
+    }
+
+    #[test]
+    fn unauthorized_rereads_credentials_and_retries_at_once() {
+        let (addr, rx) = serve(vec![401, 204]);
+        let (mut up, fd, st, dir) = setup(addr);
+        let (key, creds) = rotating_key(&dir);
+        if let Transport::Pce(t) = &mut up.transport {
+            t.credentials = creds.clone();
+        }
+        std::fs::write(&key, "api_1 rotated\n").unwrap();
+        let client = Client::builder().http1_only().build().unwrap();
+        let logs = crate::log::capture(|| assert_eq!(up.post(&client, &fd, b"gzdata", plain), Outcome::Done));
+        let (head1, _) = rx.recv().unwrap();
+        let (head2, body2) = rx.recv().unwrap();
+        assert!(head1.to_ascii_lowercase().contains("authorization: basic yxbpxze6c2vjcmv0")); // api_1:secret
+        assert!(head2.to_ascii_lowercase().contains("authorization: basic yxbpxze6cm90yxrlza==")); // api_1:rotated
+        assert!(head2.starts_with("POST /api/v2/orgs/1/traffic_data/flowlink HTTP/1.1"));
+        assert_eq!(body2, b"gzdata");
+        assert!(logs.contains(&"API credentials changed".to_string()), "{logs:?}");
+        assert!(!format!("{logs:?}").contains("rotated"), "{logs:?}");
+        let s = st.snapshot();
+        assert_eq!((s.succeeded, s.failed.get("401").copied()), (1, Some(1)));
+    }
+
+    #[test]
+    fn unauthorized_with_unchanged_credentials_backs_off() {
+        let (addr, rx) = serve(vec![401, 401]);
+        let (mut up, fd, st, dir) = setup(addr);
+        let (_key, creds) = rotating_key(&dir);
+        if let Transport::Pce(t) = &mut up.transport {
+            t.credentials = creds;
+        }
+        let client = Client::builder().http1_only().build().unwrap();
+        let logs = crate::log::capture(|| assert_eq!(up.post(&client, &fd, b"gzdata", plain), Outcome::Retry));
+        assert!(logs.contains(&"API credentials unchanged".to_string()), "{logs:?}");
+        rx.recv().unwrap();
+        assert!(rx.recv_timeout(Duration::from_millis(200)).is_err(), "retried without a change");
+        assert_eq!(st.snapshot().failed.get("401").copied(), Some(1));
+        // Fixed credentials: no re-read at all.
+        let (up, fd, _st, _dir) = setup(String::new());
+        let (addr, rx) = serve(vec![401]);
+        let up = Uploader::new(up.spool.clone(), PceTarget { pce_addr: addr, org_id: 1, credentials: Credentials::fixed("u", "t"), verify_cert: true });
+        let logs = crate::log::capture(|| assert_eq!(up.post(&client, &fd, b"gzdata", plain), Outcome::Retry));
+        assert!(!logs.iter().any(|l| l.contains("API credentials")), "{logs:?}");
+        rx.recv().unwrap();
+    }
+
+    #[test]
+    fn rotated_twice_retries_only_once() {
+        use crate::credentials::Origin;
+        // Every read prints a new secret: the retry gets a 401 too, and the re-read changes them again; back off
+        // all the same.
+        let (addr, rx) = serve(vec![401, 401]);
+        let (mut up, fd, st, dir) = setup(addr);
+        let d = dir.path().display();
+        let cmd = crate::credentials::tests::script(
+            dir.path(),
+            "key",
+            &format!("n=$(cat {d}/n 2>/dev/null || echo 0); n=$((n+1)); echo $n > {d}/n; echo api_1 s$n"),
+        );
+        let creds = Credentials::load_with(Origin::ApiKey(format!("${cmd}")), Duration::ZERO, Duration::from_secs(5)).unwrap();
+        if let Transport::Pce(t) = &mut up.transport {
+            t.credentials = creds;
+        }
+        let client = Client::builder().http1_only().build().unwrap();
+        assert_eq!(up.post(&client, &fd, b"gzdata", plain), Outcome::Retry);
+        rx.recv().unwrap();
+        rx.recv().unwrap();
+        let s = st.snapshot();
+        assert_eq!((s.failed.get("401").copied(), s.failed.get("error")), (Some(2), None));
+    }
+
     #[test]
     fn connection_error_counts_as_error() {
         // A port that was free a moment ago: nothing listens there.
@@ -379,7 +473,7 @@ mod tests {
         let spool = Arc::new(Spool::new(dir.path().to_path_buf(), 0, 500).with_stats(st)); // 0 h retention
         spool.add(b"gzdata", 7, false);
         let fd = spool.get();
-        let target = PceTarget { pce_addr: "127.0.0.1:9".into(), org_id: 1, api_user: "u".into(), api_token: "t".into(), verify_cert: true };
+        let target = PceTarget { pce_addr: "127.0.0.1:9".into(), org_id: 1, credentials: Credentials::fixed("u", "t"), verify_cert: true };
         let up = Uploader::new(spool, target);
         up.send_with_retry(Some(&Client::new()), &fd, b"gzdata");
         assert_eq!(st.snapshot().removed_by_retention, 1);

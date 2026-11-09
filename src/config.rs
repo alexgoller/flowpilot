@@ -2,12 +2,13 @@
 //! `load_and_validate`.
 
 use std::collections::BTreeMap;
-use std::sync::OnceLock;
+use std::sync::{Arc, OnceLock};
 
 use jsonschema::Validator;
 use serde::Serialize;
 use serde_json::Value;
 
+use crate::credentials::{Credentials, Origin};
 use crate::env_config::{self, Env, Source, Sources};
 use crate::secrets::go_abs;
 use crate::stats::StatsConfig;
@@ -72,6 +73,9 @@ pub struct Config {
     pub stats: StatsConfig,
     /// API user and secret given directly by variables; when set they are used instead of `api_key`.
     pub api_credentials: Option<(String, Secret)>,
+    /// FlowPilot extension: `api_user` with `api_secret_command`, used instead of `api_key` when set.
+    pub api_user: String,
+    pub api_secret_command: String,
 }
 
 /// A secret that never shows in `Debug` output.
@@ -85,12 +89,21 @@ impl std::fmt::Debug for Secret {
 }
 
 impl Config {
-    /// The PCE API user and secret: the direct credentials, else resolved from `api_key` (exits on failure).
-    pub fn credentials(&self) -> (String, String) {
+    /// Where the PCE API credentials come from: the direct credentials, else `api_user` with
+    /// `api_secret_command`, else `api_key`.
+    pub fn credential_origin(&self) -> Origin {
         match &self.api_credentials {
-            Some((user, secret)) => (user.clone(), secret.0.clone()),
-            None => crate::secrets::api_credentials(&self.api_key),
+            Some((user, secret)) => Origin::Fixed { user: user.clone(), token: secret.0.clone() },
+            None if !self.api_secret_command.is_empty() => {
+                Origin::SecretCommand { user: self.api_user.clone(), command: self.api_secret_command.clone() }
+            }
+            None => Origin::ApiKey(self.api_key.clone()),
         }
+    }
+
+    /// The PCE API credentials, read once (exits on failure); read again after a 401.
+    pub fn credentials(&self) -> Arc<Credentials> {
+        Credentials::load(self.credential_origin()).unwrap_or_else(|f| f.exit())
     }
 }
 
@@ -115,6 +128,8 @@ impl Default for Config {
             unmanaged_workloads_present: false,
             stats: StatsConfig::default(),
             api_credentials: None,
+            api_user: String::new(),
+            api_secret_command: String::new(),
         }
     }
 }
@@ -239,6 +254,17 @@ fn parse_yaml(data: &[u8]) -> Result<Value, LoadError> {
 /// ghodss/`encoding/json` semantics. An error about a value that came from a variable names it
 /// (`FLOWPILOT_ORG_ID (org_id): ...`); all others read as before.
 pub(crate) fn validate_doc(mut doc: Value, sources: &Sources) -> Result<Config, LoadError> {
+    // FlowPilot extension: `api_user` with `api_secret_command` stand in for `api_key`.
+    let set = |k: &str| doc.get(k).is_some_and(|v| !v.is_null() && v != "");
+    match (set("api_user"), set("api_secret_command")) {
+        (true, true) if doc.get("api_key").is_none_or(Value::is_null) => {
+            doc["api_key"] = "".into();
+        }
+        (true, false) | (false, true) => {
+            return Err(invalid(["api_user and api_secret_command must be set together"].iter()));
+        }
+        _ => {}
+    }
     // A failure of the validator itself cannot happen: the embedded schema is fixed.
     let errors = schema_errors(&doc);
     if !errors.is_empty() {
@@ -390,7 +416,15 @@ fn schema() -> &'static (Value, Validator) {
     static S: OnceLock<(Value, Validator)> = OnceLock::new();
     S.get_or_init(|| {
         let mut v: Value = serde_json::from_str(SCHEMA).expect("embedded schema is JSON");
-        // FlowPilot extensions: `unmanaged_workloads` and `stats`.
+        // FlowPilot extensions: `unmanaged_workloads`, `stats`, `api_user` and `api_secret_command`.
+        v["properties"]["api_user"] = serde_json::json!({
+            "description": "PCE API user (api_...), with api_secret_command",
+            "type": "string"
+        });
+        v["properties"]["api_secret_command"] = serde_json::json!({
+            "description": "Command (no shell, no leading $) that prints the PCE API secret, with api_user",
+            "type": "string"
+        });
         v["properties"]["unmanaged_workloads"] =
             serde_json::from_str(UNMANAGED_SCHEMA).expect("unmanaged schema is JSON");
         v["properties"]["stats"] =
@@ -665,6 +699,8 @@ fn decode(doc: &Value) -> Config {
         unmanaged_workloads_present: doc.get("unmanaged_workloads").is_some(),
         stats: StatsConfig::default(), // filled in by `validate`
         api_credentials: None,         // filled in by `load_from`
+        api_user: string_field(doc, "api_user"),
+        api_secret_command: string_field(doc, "api_secret_command"),
     }
 }
 
@@ -758,6 +794,11 @@ pub(crate) fn render_effective(l: &Loaded) -> String {
         Some((user, _)) => {
             line(0, "api_user", q(user), "api_key");
             line(0, "api_secret", "'********'".into(), "api_key");
+        }
+        // The command as given; it is not run here.
+        None if !c.api_secret_command.is_empty() => {
+            line(0, "api_user", q(&c.api_user), "api_user");
+            line(0, "api_secret_command", q(&c.api_secret_command), "api_secret_command");
         }
         None => line(0, "api_key", q(&c.api_key), "api_key"),
     }
@@ -915,6 +956,8 @@ fn debug_dump(c: &Config) -> Vec<String> {
     let j = ConfigJ {
         pce_addr: &c.pce_addr,
         api_key: &c.api_key,
+        api_user: &c.api_user,
+        api_secret_command: &c.api_secret_command,
         org_id: c.org_id,
         verify_pce_cert: c.verify_pce_cert,
         aggregation_minutes: c.aggregation_minutes,
@@ -1021,6 +1064,10 @@ struct ConfigJ<'a> {
     pce_addr: &'a str,
     #[serde(skip_serializing_if = "str::is_empty")]
     api_key: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    api_user: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    api_secret_command: &'a str,
     org_id: i32,
     verify_pce_cert: bool,
     aggregation_minutes: i16,
@@ -1593,6 +1640,71 @@ mod tests {
         assert!(out.contains("pce_addr: h  # PCE_HOST (plugger)"), "{out}");
         assert!(out.contains("api_user: x  # PCE_API_KEY (plugger)"), "{out}");
         assert!(out.contains("api_secret: '********'  # PCE_API_KEY (plugger)"), "{out}");
+    }
+
+    #[test]
+    fn api_secret_command_in_file() {
+        use crate::credentials::Origin;
+        let cmd = "vault kv get -field=secret secret/flowpilot";
+        // Without api_key: the pair stands in for it.
+        let yaml = cfg(&format!("api_user: api_1\napi_secret_command: {cmd}")).replace("api_key: $cat k\n", "");
+        let c = validate(yaml.as_bytes()).unwrap();
+        assert_eq!((c.api_user.as_str(), c.api_secret_command.as_str()), ("api_1", cmd));
+        assert!(c.api_key.is_empty());
+        assert!(matches!(c.credential_origin(), Origin::SecretCommand { user, command } if user == "api_1" && command == cmd));
+        // With api_key as well: the command wins.
+        let c = validate(cfg(&format!("api_user: api_1\napi_secret_command: {cmd}")).as_bytes()).unwrap();
+        assert!(matches!(c.credential_origin(), Origin::SecretCommand { .. }));
+        // Configs without the keys behave as before.
+        let c = validate(cfg("").as_bytes()).unwrap();
+        assert!(c.credential_origin() == Origin::ApiKey("$cat k".into()));
+        // Direct credentials win over both.
+        let c = Config { api_credentials: Some(("u".into(), Secret("s".into()))), api_user: "x".into(), api_secret_command: "y".into(), ..Config::default() };
+        assert!(c.credential_origin() == Origin::Fixed { user: "u".into(), token: "s".into() });
+    }
+
+    #[test]
+    fn api_secret_command_pairing() {
+        for one in ["api_user: api_1", "api_secret_command: /bin/get-secret"] {
+            let e = errors(&cfg(one));
+            assert_eq!(e, ["\t- [api_user and api_secret_command must be set together]"], "{one}");
+        }
+        let e = errors(&cfg("api_user: 5\napi_secret_command: c"));
+        assert!(e.iter().any(|l| l.contains("api_user: Invalid type. Expected: string, given: integer")), "{e:?}");
+        // Without api_key and without the pair, api_key is still required.
+        let e = errors(&cfg("").replace("api_key: $cat k\n", ""));
+        assert!(e.iter().any(|l| l.contains("api_key is required")), "{e:?}");
+    }
+
+    #[test]
+    fn print_config_shows_secret_command_never_its_output() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().to_str().unwrap();
+        let ran = dir.path().join("ran");
+        let cmd = crate::credentials::tests::script(dir.path(), "get-secret", &format!("touch {}\necho topsecret", ran.display()));
+        let path = dir.path().join("c.yaml");
+        let yaml = cfg(&format!("api_secret_command: {cmd}"))
+            .replace("api_key: $cat k\n", "")
+            .replace("data_directory: /tmp", &format!("data_directory: {d}"));
+        std::fs::write(&path, yaml).unwrap();
+        let (code, out) = effective(path.to_str().unwrap(), &env_of(&[("FLOWPILOT_API_USER", "api_1")]), &[]);
+        assert_eq!(code, 0, "{out}");
+        assert!(out.contains("api_user: api_1  # FLOWPILOT_API_USER\n"), "{out}");
+        assert!(out.contains(&format!("api_secret_command: {cmd}  # file\n")), "{out}");
+        assert!(!out.contains("api_key") && !out.contains("topsecret"), "{out}");
+        assert!(!ran.exists(), "-print-config ran the command");
+        // And from variables.
+        let vars = [
+            ("FLOWPILOT_API_USER", "api_1"),
+            ("FLOWPILOT_API_SECRET_COMMAND", cmd.as_str()),
+            ("FLOWPILOT_PCE_ADDR", "p:1"),
+            ("FLOWPILOT_DATA_DIRECTORY", d),
+            ("FLOWPILOT_NETFLOW_PORTS", "2055"),
+        ];
+        let (code, out) = effective("", &env_of(&vars), &[]);
+        assert_eq!(code, 0, "{out}");
+        assert!(out.contains(&format!("api_secret_command: {cmd}  # FLOWPILOT_API_SECRET_COMMAND\n")), "{out}");
+        assert!(!ran.exists());
     }
 
     #[test]

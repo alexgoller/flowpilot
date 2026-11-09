@@ -3,11 +3,13 @@
 
 use std::collections::BTreeSet;
 use std::net::IpAddr;
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use reqwest::blocking::{Client, RequestBuilder, Response};
 use serde_json::{json, Value};
 
+use crate::credentials::Credentials;
 use crate::uploader::{PceTarget, API_VERSION};
 
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
@@ -136,8 +138,8 @@ pub struct HttpPce {
     api_root: String,
     /// `<api_root>/orgs/<org>`.
     base: String,
-    user: String,
-    token: String,
+    /// Shared with the uploader unless `unmanaged_workloads.api_key` overrides them; read again after a 401.
+    credentials: Arc<Credentials>,
     poll_interval: Duration,
 }
 
@@ -168,8 +170,7 @@ impl HttpPce {
             client,
             base: format!("{api_root}/orgs/{}", target.org_id),
             api_root,
-            user: target.api_user.clone(),
-            token: target.api_token.clone(),
+            credentials: target.credentials.clone(),
             poll_interval: POLL_INTERVAL,
         }
     }
@@ -183,18 +184,23 @@ impl HttpPce {
     }
 
     fn get(&self, url: &str) -> RequestBuilder {
-        self.client.get(url).basic_auth(&self.user, Some(&self.token))
+        self.client.get(url)
     }
 
-    /// Send and map the status; returns the body of a 2xx response.
+    /// Authenticate, send and map the status; returns the body of a 2xx response. A 401 has the credentials read
+    /// again for the next call.
     fn send(&self, req: RequestBuilder) -> Result<(u16, Response), PceError> {
-        let resp = req.send().map_err(|e| match net_failure(&e) {
+        let (user, token) = self.credentials.current();
+        let resp = req.basic_auth(&user, Some(&token)).send().map_err(|e| match net_failure(&e) {
             Some((kind, text)) => PceError::Unreachable(kind, text),
             None => PceError::Transient(e.to_string()),
         })?;
         let status = resp.status().as_u16();
         if resp.status().is_success() {
             return Ok((status, resp));
+        }
+        if status == 401 {
+            self.credentials.refresh(&token);
         }
         Err(match status {
             401 | 403 => PceError::Auth(status),
@@ -290,7 +296,6 @@ impl PceApi for HttpPce {
         let req = self
             .client
             .post(format!("{}/labels", self.base))
-            .basic_auth(&self.user, Some(&self.token))
             .header("Content-Type", "application/json")
             .body(json!({"key": key, "value": value}).to_string());
         label_from(&self.json(req)?).ok_or_else(|| PceError::Other("label response without href/key/value".into()))
@@ -312,7 +317,6 @@ impl PceApi for HttpPce {
         let req = self
             .client
             .put(format!("{}/workloads/bulk_create", self.base))
-            .basic_auth(&self.user, Some(&self.token))
             .header("Content-Type", "application/json")
             .body(body);
         let items = array(self.json(req)?)?;
@@ -379,7 +383,7 @@ mod tests {
 
     /// Test hook: plain http against the mock, 10 ms export polling.
     fn client_for(addr: &str) -> HttpPce {
-        let target = PceTarget { pce_addr: addr.into(), org_id: 1, api_user: "api_1".into(), api_token: "secret".into(), verify_cert: true };
+        let target = PceTarget { pce_addr: addr.into(), org_id: 1, credentials: Credentials::fixed("api_1", "secret"), verify_cert: true };
         let mut pce = HttpPce::new(&target).unwrap();
         pce.api_root = pce.api_root.replacen("https://", "http://", 1);
         pce.base = pce.base.replacen("https://", "http://", 1);
@@ -447,6 +451,32 @@ mod tests {
         assert!(heads[0].to_ascii_lowercase().contains("prefer: respond-async"));
         assert!(heads[1].starts_with("GET /api/v2/orgs/1/jobs/j1 HTTP/1.1"));
         assert!(heads[3].starts_with("GET /api/v2/orgs/1/datafiles/d1 HTTP/1.1"));
+    }
+
+    #[test]
+    fn unauthorized_rereads_main_credentials_for_the_next_call() {
+        use crate::credentials::Origin;
+        let dir = tempfile::tempdir().unwrap();
+        let key = dir.path().join("api_info");
+        std::fs::write(&key, "api_1 secret\n").unwrap();
+        let origin = Origin::ApiKey(key.to_str().unwrap().into());
+        let creds = Credentials::load_with(origin, Duration::ZERO, Duration::from_secs(5)).unwrap();
+        let (addr, rx) = serve(vec![reply(401, ""), reply(200, "[]")]);
+        let mut pce = client_for(&addr);
+        pce.credentials = creds.clone();
+        std::fs::write(&key, "api_1 rotated\n").unwrap();
+        assert_eq!(pce.label_dimensions(), Err(PceError::Auth(401)));
+        assert_eq!(creds.current().1, "rotated");
+        assert!(pce.label_dimensions().is_ok());
+        assert!(rx.recv().unwrap().0.to_ascii_lowercase().contains("authorization: basic yxbpxze6c2vjcmv0"));
+        assert!(rx.recv().unwrap().0.to_ascii_lowercase().contains("authorization: basic yxbpxze6cm90yxrlza=="));
+        // A 403 is a missing permission, not a stale secret: nothing is read.
+        std::fs::write(&key, "api_1 third\n").unwrap();
+        let (addr, _rx) = serve(vec![reply(403, "")]);
+        let mut pce = client_for(&addr);
+        pce.credentials = creds.clone();
+        assert_eq!(pce.label_dimensions(), Err(PceError::Auth(403)));
+        assert_eq!(creds.current().1, "rotated");
     }
 
     #[test]

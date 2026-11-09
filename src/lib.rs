@@ -5,6 +5,7 @@ pub mod aggregator;
 pub mod cli;
 pub mod config;
 pub mod connectors;
+pub mod credentials;
 pub mod env_config;
 pub mod flow;
 pub mod instance_id;

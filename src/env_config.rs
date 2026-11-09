@@ -36,6 +36,8 @@ pub struct Overlay {
     pub doc: Value,
     pub sources: Sources,
     /// API user and secret given directly (`FLOWPILOT_API_USER`/`_SECRET`, or plugger's `PCE_API_KEY`/`_SECRET`).
+    /// `FLOWPILOT_API_USER` with `FLOWPILOT_API_SECRET_COMMAND` go into the document as `api_user` and
+    /// `api_secret_command` instead.
     pub credentials: Option<(String, Secret)>,
 }
 
@@ -96,6 +98,7 @@ const GENERAL: [(&str, &str, Kind); 13] = [
 
 const API_USER: &str = "FLOWPILOT_API_USER";
 const API_SECRET: &str = "FLOWPILOT_API_SECRET";
+const API_SECRET_COMMAND: &str = "FLOWPILOT_API_SECRET_COMMAND";
 
 /// Collectors that variables can define; each becomes a consumer of that name.
 const COLLECTORS: [&str; 4] = ["netflow", "ipfix", "sflow", "text"];
@@ -180,7 +183,7 @@ fn get(env: Env, name: &str) -> Option<String> {
 /// Every `FLOWPILOT_*` variable docs/configuration.md defines.
 fn all_vars() -> Vec<String> {
     let mut v: Vec<String> = GENERAL.iter().map(|(name, ..)| name.to_string()).collect();
-    v.extend([API_USER, API_SECRET].map(String::from));
+    v.extend([API_USER, API_SECRET, API_SECRET_COMMAND].map(String::from));
     for c in COLLECTORS {
         v.extend(["PORTS", "REMOTE_ADDRS"].map(|s| format!("FLOWPILOT_{}_{s}", c.to_uppercase())));
     }
@@ -292,13 +295,26 @@ pub fn apply(file_doc: Option<Value>, env: Env) -> Result<Option<Overlay>, Vec<S
 
     // Credentials given directly win over `api_key`; the schema still requires the key, so it is left empty.
     let mut credentials = None;
+    let command = get(env, API_SECRET_COMMAND);
+    match (&command, get(env, API_SECRET)) {
+        (Some(_), Some(_)) => errors.push(format!("set only one of {API_SECRET} and {API_SECRET_COMMAND}")),
+        (Some(c), None) => set(&mut doc, "api_secret_command", c.as_str().into(), Source::Env(API_SECRET_COMMAND.into())),
+        _ => {}
+    }
     match (get(env, API_USER), get(env, API_SECRET)) {
         (Some(user), Some(secret)) => {
             credentials = Some((user, Secret(secret)));
             set(&mut doc, "api_key", "".into(), Source::Env(API_USER.into()));
         }
+        // The user of `api_secret_command`, from a variable or the file.
+        (Some(user), None) if !is_unset(&doc, "api_secret_command") => {
+            set(&mut doc, "api_user", user.into(), Source::Env(API_USER.into()))
+        }
         (None, None) => {}
         _ => errors.push(format!("{API_USER} and {API_SECRET} must be set together")),
+    }
+    if command.is_some() && is_unset(&doc, "api_user") {
+        errors.push(format!("{API_USER} and {API_SECRET_COMMAND} must be set together"));
     }
 
     // Plugger's variables fill only what neither a variable nor the file set.
@@ -324,7 +340,7 @@ pub fn apply(file_doc: Option<Value>, env: Env) -> Result<Option<Overlay>, Vec<S
             }
         }
     }
-    if credentials.is_none() && is_unset(&doc, "api_key") {
+    if credentials.is_none() && is_unset(&doc, "api_key") && is_unset(&doc, "api_secret_command") {
         if let (Some(user), Some(secret)) = (get(env, "PCE_API_KEY"), get(env, "PCE_API_SECRET")) {
             credentials = Some((user, Secret(secret)));
             set(
@@ -811,6 +827,60 @@ mod tests {
                 "{e:?}"
             );
         }
+    }
+
+    #[test]
+    fn secret_command_vars() {
+        let cmd = "vault kv get -field=secret secret/flowpilot";
+        // Both from variables: no direct credentials, the pair goes into the document.
+        let o = ok(None, &[("FLOWPILOT_API_USER", "u"), ("FLOWPILOT_API_SECRET_COMMAND", cmd)]);
+        assert_eq!(o.credentials, None);
+        assert_eq!((o.doc["api_user"].as_str(), o.doc["api_secret_command"].as_str()), (Some("u"), Some(cmd)));
+        assert_eq!(o.sources["api_user"], env("FLOWPILOT_API_USER"));
+        assert_eq!(o.sources["api_secret_command"], env("FLOWPILOT_API_SECRET_COMMAND"));
+        // FLOWPILOT_API_USER fills api_user for a file's api_secret_command.
+        let mut f = file();
+        f["api_secret_command"] = cmd.into();
+        let o = ok(Some(f.clone()), &[("FLOWPILOT_API_USER", "u")]);
+        assert_eq!(o.doc["api_user"], "u");
+        assert_eq!(o.sources["api_secret_command"], Source::File);
+        // The command variable pairs with a file's api_user.
+        let mut g = file();
+        g["api_user"] = "fu".into();
+        let o = ok(Some(g), &[("FLOWPILOT_API_SECRET_COMMAND", cmd)]);
+        assert_eq!((o.doc["api_user"].as_str(), o.doc["api_secret_command"].as_str()), (Some("fu"), Some(cmd)));
+        // A user and command win over the plugger fallback.
+        f["api_user"] = "fu".into();
+        f.as_object_mut().unwrap().remove("api_key");
+        let o = ok(Some(f.clone()), &[("PCE_API_KEY", "x"), ("PCE_API_SECRET", "y")]);
+        assert_eq!(o.credentials, None);
+        assert!(o.doc.get("api_key").is_none());
+        // FLOWPILOT_API_USER and _SECRET win over a command.
+        let o = ok(Some(f), &[("FLOWPILOT_API_USER", "u"), ("FLOWPILOT_API_SECRET", "s")]);
+        assert_eq!(o.credentials, Some(("u".into(), Secret("s".into()))));
+        assert_eq!(o.doc["api_user"], "fu");
+    }
+
+    #[test]
+    fn secret_command_var_errors() {
+        let e = run(
+            None,
+            &[("FLOWPILOT_API_USER", "u"), ("FLOWPILOT_API_SECRET", "s"), ("FLOWPILOT_API_SECRET_COMMAND", "c")],
+        )
+        .unwrap_err();
+        assert!(
+            e.iter().any(|l| l == "set only one of FLOWPILOT_API_SECRET and FLOWPILOT_API_SECRET_COMMAND"),
+            "{e:?}"
+        );
+        let e = run(None, &[("FLOWPILOT_API_SECRET_COMMAND", "c")]).unwrap_err();
+        assert!(
+            e.iter().any(|l| l == "FLOWPILOT_API_USER and FLOWPILOT_API_SECRET_COMMAND must be set together"),
+            "{e:?}"
+        );
+        // The user alone still names the direct pair.
+        let e = run(None, &[("FLOWPILOT_API_USER", "u")]).unwrap_err();
+        assert!(e.iter().any(|l| l.contains("FLOWPILOT_API_USER and FLOWPILOT_API_SECRET must be set together")), "{e:?}");
+        assert!(unknown_vars(&["FLOWPILOT_API_SECRET_COMMAND"]).is_empty());
     }
 
     #[test]

@@ -72,11 +72,15 @@ fn daemon(flags: cli::Flags) {
     let cfg = config::load_and_validate(&std::env::var("CONFIG_FILE").unwrap_or_default());
     apply_proxy_env(&cfg.proxy_config);
 
-    let (api_user, api_token) = cfg.credentials();
+    let credentials = cfg.credentials();
     let instance = instance_id::load_or_create(&cfg.data_directory);
     // As in FlowLink: the Integrations bootstrap and the producer come after the credentials and
     // the instance id, before the aggregator and the consumers.
-    let kafka = (!cfg.pce_kafka.installation_id.is_empty()).then(|| kafka::start_output(&cfg, &api_user, &api_token));
+    // The Integrations bootstrap happens once, at start-up: it does not re-read the credentials.
+    let kafka = (!cfg.pce_kafka.installation_id.is_empty()).then(|| {
+        let (api_user, api_token) = credentials.current();
+        kafka::start_output(&cfg, &api_user, &api_token)
+    });
     if let Some(k) = &kafka {
         let _ = KAFKA.set(k.sink.clone());
     }
@@ -121,8 +125,7 @@ fn daemon(flags: cli::Flags) {
     let target = PceTarget {
         pce_addr: cfg.pce_addr.clone(),
         org_id: cfg.org_id,
-        api_user,
-        api_token,
+        credentials,
         verify_cert: cfg.verify_pce_cert,
     };
     // The unmanaged-workload counters, for the stats output. The worker uses the PCE REST API in

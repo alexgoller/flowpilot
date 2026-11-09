@@ -30,7 +30,8 @@ What the wizard does, in order:
 |---|---|
 | Binary | `/usr/local/bin/flowpilot`; the previous one is kept as `/usr/local/bin/flowpilot.prev` |
 | Config | `/etc/flowpilot/config.yaml` (root:flowpilot 0640), directory 0750 |
-| API key | `/etc/flowpilot/api_key` (root:flowpilot 0640), `user secret` format, referenced from the config |
+| API key | `/etc/flowpilot/api_key` (root:flowpilot 0640), `user secret` format, referenced from the config; not written with `--api-secret-command` |
+| Environment | `/etc/flowpilot/env`, optional, read by the unit (`EnvironmentFile=-`); the installer does not create it |
 | Data | `/var/lib/flowpilot` (flowpilot:flowpilot 0750) |
 | Service | `/etc/systemd/system/flowpilot.service`, running as the system user `flowpilot` (no login shell) |
 
@@ -52,6 +53,11 @@ printf '%s\n' "$SECRET" | sudo flowpilot install --yes --pce pce.example.com:844
   --api-user api_1a2b3c --api-secret-file - --netflow 2055@192.0.2.10 --ipfix 4739
 ```
 
+To take the secret from a key store instead, pass `--api-secret-command CMD` (or `FLOWPILOT_API_SECRET_COMMAND`)
+with `--api-user`. The installer writes `api_user` and `api_secret_command` into `config.yaml` and no key file; an
+upgrade keeps them. It cannot be combined with `--api-secret-file` or `--api-key-file`. See
+[API secret from a key store](#api-secret-from-a-key-store).
+
 `--skip-pce-check` skips the live check for a host that is provisioned before the PCE is reachable; it prints a
 warning that the key was not checked. `--no-verify-pce-cert` turns certificate verification off.
 
@@ -64,6 +70,43 @@ Run it again with the same answers and it reports `unchanged` and changes nothin
 A re-run still checks the service (the same health wait, or `systemctl is-active` when the config has no
 `stats.http_listen`) and exits 1 when it is not healthy, so a broken install does not turn green on the next play.
 
+### API secret from a key store
+
+`api_user` with `api_secret_command` takes the secret from a command that prints only the secret, such as
+`vault kv get -field=...` ([configuration.md](configuration.md#api_user-and-api_secret_command)):
+
+```
+sudo flowpilot install --yes --pce pce.example.com:8443 --org 1 --api-user api_1a2b3c \
+  --api-secret-command "vault kv get -field=secret secret/flowpilot" --netflow 2055
+```
+
+- The command gets the service's environment. Put what it needs in `/etc/flowpilot/env`, which the unit reads if it
+  exists (systemd `EnvironmentFile=` syntax, one `NAME=value` per line). Make it root:flowpilot 0640 when it holds a
+  token:
+
+  ```
+  VAULT_ADDR=https://vault.example.com:8200
+  VAULT_TOKEN=...
+  VAULT_CACERT=/etc/flowpilot/vault-ca.pem
+  ```
+
+  After a change: `sudo systemctl restart flowpilot`.
+- The installer's PCE check runs the command once (not with `--skip-pce-check`). It runs there as root, with the
+  installer's environment, not `/etc/flowpilot/env`; the service runs it as the user `flowpilot`. A command that works
+  for root may fail for `flowpilot` (a token file only root can read, say). To try it the way the service runs it,
+  without showing the secret:
+
+  ```
+  sudo systemd-run --quiet --pipe --wait -p User=flowpilot -p EnvironmentFile=-/etc/flowpilot/env \
+    vault kv get -field=secret secret/flowpilot >/dev/null && echo ok
+  ```
+- The service runs the command once at start-up, and again when the PCE answers 401: a rotated secret is picked up
+  without a restart. See [configuration.md](configuration.md#re-reading-after-a-401).
+- Instead of a command, Vault Agent can render the key into a file in the `user secret` form
+  (`{{ with secret "secret/flowpilot" }}api_1a2b3c {{ .Data.data.secret }}{{ end }}`), with `api_key` pointing at that
+  file. The file is read again after a 401 too.
+- The command line is split on whitespace and run without a shell. For pipes or quoting, point it at a script.
+
 ### Upgrade, rollback, status, uninstall
 
 - **Upgrade:** run `install` (or `upgrade`, the same command) from the newer binary. Without answers or `--reconfigure`
@@ -73,7 +116,8 @@ A re-run still checks the service (the same health wait, or `systemctl is-active
   to `flowpilot.prev` by itself, says so and exits 1. Only the binary goes back: a config the same run rewrote is
   kept, and the message names the backup of the previous one.
 - **Reconfigure:** `install --reconfigure`, or an unattended run with different answers, replaces the config. The
-  wizard offers the installed answers as defaults; only the API secret is asked for again. The old
+  wizard offers the installed answers as defaults; only the API secret is asked for again (not with a secret
+  command). The old
   file is first saved as `/etc/flowpilot/config.yaml.<timestamp>.bak` and the installer names it. The file is rewritten
   whole; comments and hand edits are not merged, so copy them over from the backup.
 - **Rollback:** `sudo flowpilot rollback` swaps `flowpilot.prev` back in and restarts. A second rollback undoes the first.
@@ -138,6 +182,8 @@ Type=simple
 User=flowpilot
 Group=flowpilot
 Environment=CONFIG_FILE=/etc/flowpilot/config.yaml
+# Optional, for what a secret command needs (VAULT_ADDR, say); the installer does not create it.
+EnvironmentFile=-/etc/flowpilot/env
 ExecStart=/usr/local/bin/flowpilot
 Restart=always
 RestartSec=10
@@ -316,6 +362,9 @@ with a literal `Z`. The partition follows from a hash of the key.
   user and secret, `Content-Type: application/x-protobuf`, `Content-Encoding: gzip`. The body is the spool file as is.
   Timeout 60 seconds per request.
 - **Success** is status 204 only. Any other status (including 200 and 202) is a failure.
+- **401.** The API credentials are read again (at most once per 60 seconds, see
+  [configuration.md](configuration.md#re-reading-after-a-401)). When they changed, the file is sent again at once;
+  otherwise the retry below applies.
 - **Retry.** After a failure (network error, TLS error or any status except 204) the sender waits 10 seconds, then
   20, 30, and so on up to 120 seconds, and tries the same file again, with no limit on attempts. The response body is
   logged. Retention is checked before every attempt: once the file is older than `file_retention_hours` it is deleted.
@@ -360,7 +409,8 @@ the first run against Illumio's Kafka.
 
 For flow upload, the API key must be accepted by the PCE for the traffic data endpoint above. The PCE role this needs
 has not been verified for this build; use the same kind of key you used for FlowLink. A refused key shows as
-`Response Code 401` or `403` in the log, and the files stay in the spool and are retried.
+`Response Code 401` or `403` in the log, and the files stay in the spool and are retried. After a 401 the log also
+shows `PCE answered 401, reading the API credentials again` and whether they changed.
 
 For unmanaged workloads (when enabled), the key needs permission to read labels, create labels, read workloads and
 create workloads. FlowPilot logs which one is missing on a 401 or 403. See

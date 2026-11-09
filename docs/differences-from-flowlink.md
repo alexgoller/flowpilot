@@ -12,6 +12,15 @@ output stays comparable ([Preserved on purpose](#preserved-on-purpose)) or delib
   a config that has this key cannot be loaded by FlowLink. Remove the key to go back. See
   [unmanaged-workloads.md](unmanaged-workloads.md).
 - **`stats`** is a new optional top-level key (stats output; same rule: FlowLink rejects the key).
+- **`api_user` and `api_secret_command`** are new top-level keys (variables `FLOWPILOT_API_USER`,
+  `FLOWPILOT_API_SECRET_COMMAND`): the secret comes from a command that prints only the secret, such as
+  `vault kv get -field=...`, run once at start-up with a 30-second limit. FlowLink rejects the keys; a config without
+  them behaves as before. See [configuration.md](configuration.md#api_user-and-api_secret_command).
+- **Credentials are read again after a 401.** When the PCE answers 401, FlowPilot runs `api_secret_command` again, or
+  reads the `api_key` file or runs its `$command` again, at most once per 60 seconds, and uses what it gets for flow
+  uploads (sent again at once when the credentials changed) and unmanaged workloads. FlowLink reads the key at
+  start-up only. A re-read `$command` is killed after 30 seconds; at start-up it has no limit, as in FlowLink. See
+  [configuration.md](configuration.md#re-reading-after-a-401).
 - **The `FLOWPILOT_STATS` log line.** Every `stats.interval_seconds` (default `metrics_print_seconds`) FlowPilot logs
   one extra line: the marker `FLOWPILOT_STATS` and a JSON object with counters per collector and exporter, the
   aggregation, the uploads and the unmanaged workloads. It is on by default and only adds to the log; `stats.log:

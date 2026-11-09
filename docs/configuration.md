@@ -70,6 +70,10 @@ Every setting can also come from an environment variable, so a container needs n
 5. With neither a file nor any `FLOWPILOT_*` variable, FlowPilot behaves as before: `No config file provided`, exit 1.
    `PCE_*` alone do not count.
 
+Where the API credentials come from, highest first: `FLOWPILOT_API_USER` with `FLOWPILOT_API_SECRET`; then
+`api_user` with `api_secret_command` (from the variables or the file); then `api_key`; then plugger's `PCE_API_KEY` and
+`PCE_API_SECRET`, used only when none of the others is set.
+
 The merged result goes through the same schema validation and checks as a file. When a rejected value came from a
 variable, the error names it:
 
@@ -96,6 +100,7 @@ The FlowPilot configuration file is not valid. see errors :
 | `FLOWPILOT_ORG_ID` | `org_id` | Fallback: `PCE_ORG_ID` |
 | `FLOWPILOT_API_KEY` | `api_key` | Same forms as in the file: a path, or `$command` |
 | `FLOWPILOT_API_USER`, `FLOWPILOT_API_SECRET` | | The credentials themselves, instead of `api_key`. Both or neither. Fallback: `PCE_API_KEY`, `PCE_API_SECRET`. If both forms are given, these win |
+| `FLOWPILOT_API_USER`, `FLOWPILOT_API_SECRET_COMMAND` | `api_user`, `api_secret_command` | A command that prints the secret, instead of `api_key`. `FLOWPILOT_API_USER` pairs with either `FLOWPILOT_API_SECRET` or `FLOWPILOT_API_SECRET_COMMAND`; setting both of those is an error (`set only one of ...`). `FLOWPILOT_API_USER` alone also fills `api_user` for an `api_secret_command` in the file |
 | `FLOWPILOT_VERIFY_PCE_CERT` | `verify_pce_cert` | |
 | `FLOWPILOT_DATA_DIRECTORY` | `data_directory` | See the data directory rule below |
 | `FLOWPILOT_DATA_DIRECTORY_SIZE_MB` | `data_directory_size_mb` | |
@@ -181,8 +186,8 @@ directory comes from a variable or the default and is missing, it is not created
 `(will be created at start)`.
 
 Each value has a trailing comment with its origin: `file`, the variable name, `<VAR> (plugger)` for a fallback, or
-`default`. The API secret is shown as `'********'`; an `api_key` that is a path or `$command` is shown as given, and
-what it reads or prints never is. A user and password in a proxy URL are shown as `***`
+`default`. The API secret is shown as `'********'`; an `api_key` that is a path or `$command`, and an
+`api_secret_command`, are shown as given, and what they read or print never is (`-print-config` does not run them). A user and password in a proxy URL are shown as `***`
 (`http://***@proxy:3128`). This is the tool for "why is it doing that".
 
 ```
@@ -274,12 +279,15 @@ unmanaged_workloads:
 
 ## Top-level keys
 
-Required keys: `pce_addr`, `api_key`, `data_directory`, `consumers`.
+Required keys: `pce_addr`, `api_key`, `data_directory`, `consumers`. `api_key` is not required when `api_user` and
+`api_secret_command` are set.
 
 | Key | Type | Default | Allowed | Meaning |
 |---|---|---|---|---|
 | `pce_addr` | string | required | | PCE host and port, for example `pce.example.com:8443`. Used as `https://<pce_addr>/api/...`. |
 | `api_key` | string | required | | Where to get the API key: a file or a `$command`. See [API key](#api_key). |
+| `api_user` | string | none | | The API user, with `api_secret_command`. New in FlowPilot. See [api_user and api_secret_command](#api_user-and-api_secret_command). |
+| `api_secret_command` | string | none | | A command that prints the API secret, with `api_user`. New in FlowPilot. |
 | `org_id` | integer | `1` | at least 1 | Organisation id in the PCE. |
 | `verify_pce_cert` | boolean | `true` | | Verify the PCE TLS certificate against the system trust store. `false` accepts any certificate. |
 | `aggregation_minutes` | integer | `10` | 5 to 60 | Length of the aggregation window. One upload batch is produced per window. |
@@ -313,6 +321,47 @@ The key text must be in one of these forms:
 
 Anything else logs `Unable to obtain api key information` and exits 1. For the two-word form the source is read twice,
 so a command is run twice at start-up.
+
+When the PCE answers 401, the source is read again; see [Re-reading after a 401](#re-reading-after-a-401).
+
+### api_user and api_secret_command
+
+New in FlowPilot. For key stores whose command line prints one field, such as Vault:
+
+```yaml
+api_user: api_1a2b3c4d4e5f
+api_secret_command: vault kv get -field=secret secret/flowpilot
+```
+
+- Both keys or neither; one alone is a validation error (`api_user and api_secret_command must be set together`).
+  With both set, `api_key` is not required, and is ignored if present. `FLOWPILOT_API_USER` and
+  `FLOWPILOT_API_SECRET` still win over them.
+- The value is the command itself, with no leading `$`. It runs like an `api_key` `$command`: split on whitespace, no
+  shell (no quoting, pipes or redirects), the program found through `PATH` or given with a path, standard input
+  empty. It inherits FlowPilot's environment, so `VAULT_ADDR`, `VAULT_TOKEN` or `VAULT_CACERT` set for the service
+  reach it (see [operations.md](operations.md#api-secret-from-a-key-store)).
+- It runs once at start-up. Its standard output, trimmed, is the secret. Output that is empty or contains whitespace
+  logs `API secret command printed no usable secret` and exits 1. A failing command logs
+  `Command failed: <the command's stderr>` and exits 1. A command still running after 30 seconds is killed, and
+  FlowPilot logs `Command timed out after 30 seconds: <program>` and exits 1. The output is never logged.
+
+### Re-reading after a 401
+
+When the PCE answers a request with 401, FlowPilot reads the credentials again: it runs `api_secret_command` again, or
+reads the `api_key` file or runs its `$command` again. A secret rotated in the key store, or a key file rewritten by
+Vault Agent, is picked up without a restart. Credentials given as `FLOWPILOT_API_USER` and `FLOWPILOT_API_SECRET`, or
+by plugger's variables, are not re-read.
+
+- At most one read per 60 seconds. Senders that get a 401 at the same time wait for that one read.
+- The log shows `PCE answered 401, reading the API credentials again`, then `API credentials changed` or
+  `API credentials unchanged`. A read that fails logs the usual message (`Command failed: ...`,
+  `Command timed out after 30 seconds: ...`) and keeps the old credentials; FlowPilot keeps running. A re-read
+  `$command` in `api_key` is also killed after 30 seconds.
+- Flow uploads: when the credentials changed, the file is sent again at once with the new ones. Otherwise the usual
+  backoff applies. The 401 counts as one failed upload either way.
+- Unmanaged workloads use the new credentials from their next PCE call, unless `unmanaged_workloads.api_key` overrides
+  them; an override is read once at start-up only.
+- The PCE Kafka bootstrap reads the credentials at start-up only.
 
 ### proxy_config
 

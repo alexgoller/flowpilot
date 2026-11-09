@@ -37,7 +37,10 @@ FlowPilot has its own version numbers, starting at 0.9.0. Each release is compat
   [docs/configuration.md](docs/configuration.md#pce_kafka).
 - Kafka input for the text parser: consumer groups, TLS with a client certificate. See
   [docs/collectors.md](docs/collectors.md#kafka-input).
-- API key from a file or from a command, HTTP proxy settings, certificate verification switch.
+- API key from a file or from a command, or the secret from a key-store command such as `vault kv get -field=...`
+  (`api_secret_command`); the key is read again when the PCE answers 401, so a rotated secret needs no restart. See
+  [docs/configuration.md](docs/configuration.md#api_user-and-api_secret_command). HTTP proxy settings, certificate
+  verification switch.
 - Unmanaged workload creation: IPs inside your networks that reach a flow threshold get a workload with labels from
   CIDR rules and a reverse-DNS hostname, with per-window and per-day caps and a dry run. See
   [docs/unmanaged-workloads.md](docs/unmanaged-workloads.md).

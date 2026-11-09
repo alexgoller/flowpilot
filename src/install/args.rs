@@ -74,6 +74,8 @@ pub struct InstallArgs {
     /// `-` reads the secret from stdin. There is deliberately no flag carrying the secret itself.
     pub api_secret_file: Option<PathBuf>,
     pub api_key_file: Option<PathBuf>,
+    /// `--api-secret-command`: a command that prints the secret, written to the config instead of a key file.
+    pub api_secret_command: Option<String>,
     pub collectors: Vec<CollectorArg>,
     pub text: TextArgs,
     pub unmanaged: UnmanagedArgs,
@@ -108,6 +110,7 @@ Usage: flowpilot install|upgrade [flags]
   --api-user USER              API user (api_...)
   --api-secret-file PATH       file holding the API secret ('-' reads stdin)
   --api-key-file PATH          API key JSON as downloaded from the PCE
+  --api-secret-command CMD     command that prints the API secret (with --api-user)
   --netflow PORTS[@ADDRS]      add a NetFlow collector
   --ipfix PORTS[@ADDRS]        add an IPFIX collector
   --sflow PORTS[@ADDRS]        add an sFlow collector
@@ -154,7 +157,7 @@ Usage: flowpilot status [flags]
 
 /// Every install flag that takes a value (the rest are switches).
 const VALUE_FLAGS: &[&str] = &[
-    "pce", "org", "proxy", "api-user", "api-secret-file", "api-key-file", "root", "netflow", "ipfix", "sflow", "text",
+    "pce", "org", "proxy", "api-user", "api-secret-file", "api-key-file", "api-secret-command", "root", "netflow", "ipfix", "sflow", "text",
     "text-src-ip", "text-dst-ip", "text-dst-port", "text-protocol", "text-octets", "text-icmp-type",
     "text-icmp-code", "text-timestamp", "text-timestamp-format", "text-only-recs", "text-field-separator",
     "text-attribute-separator", "unmanaged-networks", "unmanaged-min-flows", "unmanaged-max-per-window",
@@ -203,6 +206,7 @@ pub fn parse_install(args: &[String]) -> Result<InstallArgs, Usage> {
                     "api-user" => a.api_user = some(),
                     "api-secret-file" => a.api_secret_file = path(),
                     "api-key-file" => a.api_key_file = path(),
+                    "api-secret-command" => a.api_secret_command = some(),
                     "root" => a.root = path(),
                     "netflow" => a.collectors.push(CollectorArg::parse(CollectorKind::Netflow, &v)),
                     "ipfix" => a.collectors.push(CollectorArg::parse(CollectorKind::Ipfix, &v)),
@@ -316,6 +320,17 @@ mod tests {
         assert_eq!(a.unmanaged.min_flows, Some(5));
         assert_eq!(a.verify_pce_cert, Some(false));
         assert_eq!(a.root, Some(PathBuf::from("/r")));
+    }
+
+    #[test]
+    fn api_secret_command_flag() {
+        let cmd = "vault kv get -field=secret secret/flowpilot";
+        let a = parse_install(&v(&["--api-user", "api_1", "--api-secret-command", cmd])).unwrap();
+        assert_eq!((a.api_user.as_deref(), a.api_secret_command.as_deref()), (Some("api_1"), Some(cmd)));
+        let a = parse_install(&v(&[&format!("--api-secret-command={cmd}")])).unwrap();
+        assert_eq!(a.api_secret_command.as_deref(), Some(cmd));
+        assert_eq!(parse_install(&v(&["--api-secret-command"])).unwrap_err().code, 2);
+        assert!(parse_install(&v(&["-h"])).unwrap_err().text.contains("--api-secret-command CMD"));
     }
 
     #[test]

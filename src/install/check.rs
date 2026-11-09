@@ -5,6 +5,7 @@ use std::fmt;
 
 use crate::credentials::Credentials;
 use crate::install::answers::{Answers, Proxy};
+use crate::secrets::{secret_command, COMMAND_TIMEOUT};
 use crate::stats::redact_userinfo;
 use crate::uploader::PceTarget;
 use crate::unmanaged::pce::{HttpPce, NetFailure, PceApi, PceError};
@@ -19,6 +20,8 @@ pub enum CheckError {
     /// The user or secret cannot be written to the `user secret` key file (it holds whitespace); found before any
     /// request.
     KeyFormat,
+    /// `--api-secret-command` failed or printed no usable secret; what `flowpilot` would log about it.
+    SecretCommand(String),
     Other(String),
 }
 
@@ -33,12 +36,14 @@ impl fmt::Display for CheckError {
             ),
             CheckError::Auth(code) => write!(f, "The PCE rejected the API key (HTTP {code}); check the user, the secret and the organization."),
             CheckError::KeyFormat => write!(f, "The API user and secret cannot contain spaces."),
+            CheckError::SecretCommand(e) => write!(f, "The API secret command did not give a secret: {}", e.trim_end()),
             CheckError::Other(e) => write!(f, "The PCE check failed: {e}."),
         }
     }
 }
 
-/// `KeyFormat` when the user or secret holds whitespace: the key file is `user secret`, split at whitespace.
+/// `KeyFormat` when the user or secret holds whitespace: the key file is `user secret`, split at whitespace. A secret
+/// command's output is checked when it runs.
 pub fn key_format(a: &Answers) -> Result<(), CheckError> {
     if a.api_user.contains(char::is_whitespace) || a.api_secret.0.contains(char::is_whitespace) {
         return Err(CheckError::KeyFormat);
@@ -65,10 +70,15 @@ pub(crate) fn service_proxy(p: &Proxy) -> reqwest::Result<Option<reqwest::Proxy>
 
 /// `check_pce` with the client builder injectable; tests point it at a plain-http mock.
 pub(crate) fn check_with(a: &Answers, build: impl FnOnce(&PceTarget) -> reqwest::Result<HttpPce>) -> Result<(), CheckError> {
+    // A secret command runs here, once, as the user running the installer (the service runs it as `flowpilot`).
+    let secret = match &a.api_secret_command {
+        Some(cmd) => secret_command(cmd, COMMAND_TIMEOUT).map_err(|f| CheckError::SecretCommand(f.to_string()))?,
+        None => a.api_secret.0.clone(),
+    };
     let target = PceTarget {
         pce_addr: a.pce_addr.clone(),
         org_id: a.org_id,
-        credentials: Credentials::fixed(a.api_user.clone(), a.api_secret.0.clone()),
+        credentials: Credentials::fixed(a.api_user.clone(), secret),
         verify_cert: a.verify_pce_cert,
     };
     // An error text can name the proxy, user and password included.
@@ -100,6 +110,7 @@ mod tests {
             org_id: 1,
             api_user: "api_1".into(),
             api_secret: Secret("secret".into()),
+            api_secret_command: None,
             collectors: vec![],
             text: TextArgs::default(),
             unmanaged: None,
@@ -141,6 +152,30 @@ mod tests {
     fn check_pce_auth_error() {
         let addr = serve(401, "");
         assert_eq!(plain(&answers(&addr)), Err(CheckError::Auth(401)));
+    }
+
+    #[test]
+    fn check_runs_the_secret_command_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let d = dir.path().display();
+        let cmd = crate::credentials::tests::script(dir.path(), "get-secret", &format!("echo run >> {d}/runs\necho secret"));
+        let mut a = answers(&serve(200, "[]"));
+        a.api_secret = Secret(String::new());
+        a.api_secret_command = Some(cmd);
+        assert_eq!(plain(&a), Ok(()));
+        assert_eq!(std::fs::read_to_string(dir.path().join("runs")).unwrap(), "run\n");
+        // A failing command stops the check before any request.
+        let dead = TcpListener::bind("127.0.0.1:0").unwrap().local_addr().unwrap().to_string();
+        let mut a = answers(&dead);
+        a.api_secret_command = Some(crate::credentials::tests::script(dir.path(), "bad", "echo nope-out\necho sealed >&2\nexit 1"));
+        let e = plain(&a).unwrap_err();
+        assert_eq!(e, CheckError::SecretCommand("Command failed: sealed\n".into()));
+        assert_eq!(e.to_string(), "The API secret command did not give a secret: Command failed: sealed");
+        a.api_secret_command = Some(crate::credentials::tests::script(dir.path(), "empty", "true"));
+        assert_eq!(
+            plain(&a).unwrap_err().to_string(),
+            "The API secret command did not give a secret: API secret command printed no usable secret"
+        );
     }
 
     #[test]

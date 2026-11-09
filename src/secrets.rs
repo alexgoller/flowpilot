@@ -34,6 +34,20 @@ pub(crate) enum Failure {
     Timeout { program: String, after: Duration },
 }
 
+/// The text `report` logs (the first line only for an unreadable file); for the installer.
+impl std::fmt::Display for Failure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Failure::Command(stderr) => write!(f, "Command failed: {stderr}"),
+            Failure::Read { err, .. } => write!(f, "Error: {err}"),
+            Failure::Message(m) => f.write_str(m),
+            Failure::Timeout { program, after } => {
+                write!(f, "Command timed out after {} seconds: {program}", after.as_secs_f64())
+            }
+        }
+    }
+}
+
 impl Failure {
     pub(crate) fn exit(self) -> ! {
         match self {
@@ -59,9 +73,7 @@ impl Failure {
                 crate::log_line!("Error reading file:", path);
             }
             Failure::Message(m) => crate::log_line!(m),
-            Failure::Timeout { program, after } => {
-                crate::log_line!(format!("Command timed out after {} seconds: {program}", after.as_secs_f64()))
-            }
+            t @ Failure::Timeout { .. } => crate::log_line!(t),
         }
     }
 }

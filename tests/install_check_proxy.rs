@@ -37,6 +37,7 @@ fn check_ignores_proxy_variables_of_the_shell() {
         org_id: 1,
         api_user: "api_1".into(),
         api_secret: Secret("secret".into()),
+        api_secret_command: None,
         collectors: vec![],
         text: TextArgs::default(),
         unmanaged: None,

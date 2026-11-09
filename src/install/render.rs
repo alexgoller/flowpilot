@@ -113,12 +113,19 @@ fn unmanaged(u: &UnmanagedArgs) -> Mapping {
     m
 }
 
-/// The `config.yaml` for these answers. The API key stays out: the config only names the key file.
+/// The `config.yaml` for these answers. The API key stays out: the config names the key file, or holds the user and
+/// the secret command.
 pub fn config_yaml(a: &Answers, stats_listen: &str) -> String {
     let mut m = Mapping::new();
     put(&mut m, "pce_addr", &a.pce_addr);
     put(&mut m, "org_id", a.org_id);
-    put(&mut m, "api_key", API_KEY_PATH);
+    match &a.api_secret_command {
+        Some(cmd) => {
+            put(&mut m, "api_user", &a.api_user);
+            put(&mut m, "api_secret_command", cmd);
+        }
+        None => put(&mut m, "api_key", API_KEY_PATH),
+    }
     put(&mut m, "verify_pce_cert", a.verify_pce_cert);
     put(&mut m, "data_directory", DATA_DIRECTORY);
     let p = &a.proxy;
@@ -181,6 +188,8 @@ Type=simple
 User=flowpilot
 Group=flowpilot
 Environment=CONFIG_FILE=/etc/flowpilot/config.yaml
+# Optional, for what a secret command needs (VAULT_ADDR, say); the installer does not create it.
+EnvironmentFile=-/etc/flowpilot/env
 ExecStart=/usr/local/bin/flowpilot
 Restart=always
 RestartSec=10
@@ -233,6 +242,7 @@ mod tests {
             org_id: 1,
             api_user: "api_1".into(),
             api_secret: Secret("s3cret".into()),
+            api_secret_command: None,
             collectors: vec![CollectorArg { kind: CollectorKind::Netflow, ports: "2055".into(), remote_addrs: None }],
             text: TextArgs::default(),
             unmanaged: None,
@@ -327,6 +337,28 @@ mod tests {
         let c = crate::config::validate(text.as_bytes()).unwrap();
         assert_eq!(c.proxy_config.https_proxy, "http://proxy.example.com:3128");
         assert_eq!(c.proxy_config.no_proxy, "localhost");
+    }
+
+    #[test]
+    fn secret_command_config() {
+        let mut a = base();
+        a.api_secret = Secret(String::new());
+        a.api_secret_command = Some("vault kv get -field=secret secret/flowpilot".into());
+        let text = config_yaml(&a, STATS);
+        assert!(
+            text.starts_with(
+                "pce_addr: pce.example.com:8443\norg_id: 1\napi_user: api_1\napi_secret_command: vault kv get -field=secret secret/flowpilot\nverify_pce_cert: true\n"
+            ),
+            "{text}"
+        );
+        assert!(!text.contains("api_key"), "{text}");
+        let c = crate::config::validate(text.as_bytes()).unwrap();
+        assert_eq!(c.api_secret_command, "vault kv get -field=secret secret/flowpilot");
+    }
+
+    #[test]
+    fn unit_reads_optional_environment_file() {
+        assert!(unit(&base()).contains("\nEnvironmentFile=-/etc/flowpilot/env\n"));
     }
 
     #[test]

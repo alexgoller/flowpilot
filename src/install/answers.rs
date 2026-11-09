@@ -19,6 +19,9 @@ pub struct Answers {
     pub org_id: i32,
     pub api_user: String,
     pub api_secret: Secret,
+    /// `--api-secret-command`: the secret comes from this command, in the service and in the PCE check; `api_secret`
+    /// is then empty and no key file is written.
+    pub api_secret_command: Option<String>,
     pub collectors: Vec<CollectorArg>,
     pub text: TextArgs,
     /// `None` when unmanaged-workload creation is off.
@@ -61,6 +64,7 @@ pub(crate) const ANSWER_VARS: &[&str] = &[
     "FLOWPILOT_ORG_ID",
     "FLOWPILOT_API_USER",
     "FLOWPILOT_API_SECRET",
+    "FLOWPILOT_API_SECRET_COMMAND",
     "FLOWPILOT_VERIFY_PCE_CERT",
     "FLOWPILOT_HTTPS_PROXY",
     "FLOWPILOT_NETFLOW_PORTS",
@@ -143,6 +147,7 @@ pub fn defaults() -> Answers {
         org_id: 1,
         api_user: String::new(),
         api_secret: Secret(String::new()),
+        api_secret_command: None,
         collectors: vec![CollectorArg { kind: CollectorKind::Netflow, ports: "2055".into(), remote_addrs: None }],
         text: TextArgs::default(),
         unmanaged: None,
@@ -166,28 +171,49 @@ pub fn from_args_over(args: &InstallArgs, env: Env, base: Answers) -> Result<Ans
         .or_else(|| bool_var(env, "FLOWPILOT_VERIFY_PCE_CERT", &mut errors))
         .unwrap_or(base.verify_pce_cert);
 
-    // Credentials: a key file gives both; an explicit user or secret file overrides its half.
-    let (mut api_user, mut secret) = (base.api_user, base.api_secret.0);
+    // Credentials: a key file gives both; an explicit user or secret file overrides its half. A secret command takes
+    // the place of the secret.
+    let (mut api_user, mut secret, mut command) = (base.api_user, base.api_secret.0, base.api_secret_command);
+    let command_flag = args.api_secret_command.as_deref().map(str::trim).filter(|c| !c.is_empty());
+    if command_flag.is_some() && (args.api_secret_file.is_some() || args.api_key_file.is_some()) {
+        errors.push("--api-secret-command cannot be combined with --api-secret-file or --api-key-file".into());
+    }
+    let mut command_given = command_flag.is_some();
     if let Some(f) = &args.api_key_file {
         match read_source(f) {
             Ok(text) => match crate::secrets::api_key_json(&text) {
-                Some((u, s)) => (api_user, secret) = (u.trim().into(), s.trim().into()),
+                Some((u, s)) => (api_user, secret, command) = (u.trim().into(), s.trim().into(), None),
                 None => errors.push(format!("{}: not a PCE API key JSON file", f.display())),
             },
             Err(e) => errors.push(e),
         }
     } else {
         api_user = var(env, "FLOWPILOT_API_USER").unwrap_or(api_user);
-        secret = var(env, "FLOWPILOT_API_SECRET").unwrap_or(secret);
+        match (var(env, "FLOWPILOT_API_SECRET"), var(env, "FLOWPILOT_API_SECRET_COMMAND")) {
+            (Some(_), Some(_)) => {
+                errors.push("set only one of FLOWPILOT_API_SECRET and FLOWPILOT_API_SECRET_COMMAND".into())
+            }
+            (Some(s), None) => (secret, command) = (s, None),
+            (None, Some(c)) if args.api_secret_file.is_none() => {
+                (secret, command, command_given) = (String::new(), Some(c.trim().into()), true)
+            }
+            _ => {}
+        }
     }
     if let Some(u) = &args.api_user {
         api_user = u.clone();
     }
     if let Some(f) = &args.api_secret_file {
         match read_source(f) {
-            Ok(s) => secret = s,
+            Ok(s) => (secret, command) = (s, None),
             Err(e) => errors.push(e),
         }
+    }
+    if let Some(c) = command_flag {
+        (secret, command) = (String::new(), Some(c.into()));
+    }
+    if command_given && api_user.trim().is_empty() {
+        errors.push("--api-secret-command needs --api-user (or FLOWPILOT_API_USER)".into());
     }
 
     // Collectors: flags, else the variables, else the base's, else NetFlow on 2055.
@@ -254,6 +280,7 @@ pub fn from_args_over(args: &InstallArgs, env: Env, base: Answers) -> Result<Ans
         org_id,
         api_user: api_user.trim().into(),
         api_secret: Secret(secret.trim().into()),
+        api_secret_command: command,
         collectors,
         text,
         unmanaged,
@@ -263,7 +290,7 @@ pub fn from_args_over(args: &InstallArgs, env: Env, base: Answers) -> Result<Ans
 }
 
 /// The answers an existing install was made with: its `config.yaml` and its `api_key` file (`user secret`, or the
-/// PCE's key JSON). Used to keep an install as it is (an upgrade, or a re-run that gives no answers).
+/// PCE's key JSON; not read when the config has `api_secret_command`). Used to keep an install as it is (an upgrade, or a re-run that gives no answers).
 pub fn from_existing(config_yaml: &[u8], api_key: &[u8]) -> Result<Answers, String> {
     let doc: Value = serde_yaml::from_slice(config_yaml).map_err(|e| format!("not YAML: {e}"))?;
     let pce_addr = doc.get("pce_addr").and_then(Value::as_str).ok_or("no pce_addr")?.to_string();
@@ -310,9 +337,12 @@ pub fn from_existing(config_yaml: &[u8], api_key: &[u8]) -> Result<Answers, Stri
         }
     });
 
+    let command = doc.get("api_secret_command").and_then(Value::as_str).filter(|c| !c.is_empty()).map(String::from);
     let key = String::from_utf8_lossy(api_key);
     let key = key.trim();
-    let (api_user, secret) = if key.contains("key_id") {
+    let (api_user, secret) = if command.is_some() {
+        (doc.get("api_user").and_then(Value::as_str).ok_or("api_secret_command without api_user")?.to_string(), String::new())
+    } else if key.contains("key_id") {
         crate::secrets::api_key_json(key).ok_or("the API key file is not valid key JSON")?
     } else {
         match key.split_whitespace().collect::<Vec<_>>()[..] {
@@ -326,6 +356,7 @@ pub fn from_existing(config_yaml: &[u8], api_key: &[u8]) -> Result<Answers, Stri
         org_id,
         api_user,
         api_secret: Secret(secret),
+        api_secret_command: command,
         collectors,
         text,
         unmanaged,
@@ -368,7 +399,7 @@ impl Answers {
         if self.pce_addr.is_empty() {
             m.push("pce");
         }
-        if self.api_user.is_empty() || self.api_secret.0.is_empty() {
+        if self.api_user.is_empty() || (self.api_secret.0.is_empty() && self.api_secret_command.is_none()) {
             m.push("api key");
         }
         m
@@ -488,6 +519,65 @@ mod tests {
         assert_eq!((a.proxy.https.as_str(), a.proxy.no_proxy.as_str()), ("http://q:3128", "localhost"));
     }
 
+    const CMD: &str = "vault kv get -field=secret secret/flowpilot";
+
+    #[test]
+    fn answers_with_secret_command() {
+        let args = InstallArgs { api_user: Some("api_1".into()), api_secret_command: Some(CMD.into()), ..Default::default() };
+        let a = from_args(&args, &|_| None).unwrap();
+        assert_eq!((a.api_user.as_str(), a.api_secret_command.as_deref(), a.api_secret.0.as_str()), ("api_1", Some(CMD), ""));
+        assert!(!a.missing().contains(&"api key"));
+        // From variables.
+        let env: HashMap<_, _> = [("FLOWPILOT_API_USER", "api_env"), ("FLOWPILOT_API_SECRET_COMMAND", CMD)].into();
+        let a = from_args(&InstallArgs::default(), &env_of(&env)).unwrap();
+        assert_eq!((a.api_user.as_str(), a.api_secret_command.as_deref()), ("api_env", Some(CMD)));
+        // A secret file flag beats the command variable.
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("secret");
+        std::fs::write(&f, "s3cret\n").unwrap();
+        let args = InstallArgs { api_secret_file: Some(f), ..Default::default() };
+        let a = from_args(&args, &env_of(&env)).unwrap();
+        assert_eq!((a.api_secret.0.as_str(), a.api_secret_command), ("s3cret", None));
+        // A base with a command keeps it; a new secret replaces it.
+        let base = Answers { api_user: "api_1".into(), api_secret_command: Some(CMD.into()), ..defaults() };
+        let a = from_args_over(&InstallArgs::default(), &|_| None, base.clone()).unwrap();
+        assert_eq!(a.api_secret_command.as_deref(), Some(CMD));
+        let env: HashMap<_, _> = [("FLOWPILOT_API_SECRET", "s")].into();
+        let a = from_args_over(&InstallArgs::default(), &env_of(&env), base).unwrap();
+        assert_eq!((a.api_secret.0.as_str(), a.api_secret_command), ("s", None));
+    }
+
+    #[test]
+    fn secret_command_is_exclusive_and_needs_a_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("secret");
+        std::fs::write(&f, "s3cret\n").unwrap();
+        let cmd = Some(CMD.to_string());
+        let user = Some("api_1".to_string());
+        for args in [
+            InstallArgs { api_user: user.clone(), api_secret_command: cmd.clone(), api_secret_file: Some(f.clone()), ..Default::default() },
+            InstallArgs { api_secret_command: cmd.clone(), api_key_file: Some(f.clone()), ..Default::default() },
+        ] {
+            let e = from_args(&args, &|_| None).unwrap_err();
+            assert!(e.contains(&"--api-secret-command cannot be combined with --api-secret-file or --api-key-file".into()), "{e:?}");
+        }
+        let e = from_args(&InstallArgs { api_secret_command: cmd, ..Default::default() }, &|_| None).unwrap_err();
+        assert_eq!(e, ["--api-secret-command needs --api-user (or FLOWPILOT_API_USER)"]);
+        let env: HashMap<_, _> = [("FLOWPILOT_API_SECRET", "s"), ("FLOWPILOT_API_SECRET_COMMAND", CMD), ("FLOWPILOT_API_USER", "u")].into();
+        let e = from_args(&InstallArgs::default(), &env_of(&env)).unwrap_err();
+        assert_eq!(e, ["set only one of FLOWPILOT_API_SECRET and FLOWPILOT_API_SECRET_COMMAND"]);
+    }
+
+    #[test]
+    fn from_existing_keeps_secret_command() {
+        let a = Answers { pce_addr: "pce.example.com:8443".into(), api_user: "api_1".into(), api_secret_command: Some(CMD.into()), ..defaults() };
+        let config = crate::install::render::config_yaml(&a, "127.0.0.1:9180");
+        // No key file is needed (and an old one is not read).
+        let back = from_existing(config.as_bytes(), b"").unwrap();
+        assert_eq!(back, a);
+        assert_eq!(from_existing(config.as_bytes(), b"old s3cret\n").unwrap(), a);
+    }
+
     #[test]
     fn proxy_from_flag_then_env() {
         let env: HashMap<_, _> = [("FLOWPILOT_HTTPS_PROXY", "http://env-proxy:3128")].into();
@@ -538,6 +628,7 @@ mod tests {
             org_id: 3,
             api_user: "api_1".into(),
             api_secret: Secret("s3cret".into()),
+            api_secret_command: None,
             collectors: vec![
                 CollectorArg { kind: CollectorKind::Netflow, ports: "2055".into(), remote_addrs: s("192.0.2.10") },
                 CollectorArg { kind: CollectorKind::Text, ports: "514".into(), remote_addrs: None },

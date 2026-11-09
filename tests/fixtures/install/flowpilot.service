@@ -10,6 +10,8 @@ Type=simple
 User=flowpilot
 Group=flowpilot
 Environment=CONFIG_FILE=/etc/flowpilot/config.yaml
+# Optional, for what a secret command needs (VAULT_ADDR, say); the installer does not create it.
+EnvironmentFile=-/etc/flowpilot/env
 ExecStart=/usr/local/bin/flowpilot
 Restart=always
 RestartSec=10

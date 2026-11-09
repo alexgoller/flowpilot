@@ -100,7 +100,7 @@ pub fn ask_with(
             return Err(WizardError::CheckFailed(e));
         }
         match e {
-            CheckError::Auth(_) | CheckError::KeyFormat => key(p, &mut a, true)?,
+            CheckError::Auth(_) | CheckError::KeyFormat | CheckError::SecretCommand(_) => key(p, &mut a, true)?,
             CheckError::Resolve(_) | CheckError::Connect(_) | CheckError::Certificate(_) | CheckError::Other(_) => {
                 pce_address(p, &mut a)?;
                 proxy(p, &mut a)?;
@@ -136,10 +136,10 @@ fn proxy(p: &mut dyn Prompter, a: &mut Answers) -> Ask<()> {
     Ok(())
 }
 
-/// The secret is asked when missing, or when the PCE refused the one given (`again`).
+/// The secret is asked when missing, or when the PCE refused the one given (`again`); never with a secret command.
 fn key(p: &mut dyn Prompter, a: &mut Answers, again: bool) -> Ask<()> {
     a.api_user = p.text("API user", Some(&a.api_user))?.trim().to_string();
-    if again || a.api_secret.0.is_empty() {
+    if a.api_secret_command.is_none() && (again || a.api_secret.0.is_empty()) {
         a.api_secret = Secret(p.secret("API secret")?.trim().to_string());
     }
     Ok(())

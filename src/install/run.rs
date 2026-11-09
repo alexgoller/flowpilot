@@ -319,6 +319,7 @@ fn answers_given(args: &InstallArgs, env: Env) -> bool {
         || args.api_user.is_some()
         || args.api_secret_file.is_some()
         || args.api_key_file.is_some()
+        || args.api_secret_command.is_some()
         || !args.collectors.is_empty()
         || args.text != Default::default()
         || args.unmanaged != Default::default()
@@ -494,6 +495,30 @@ mod tests {
         assert!(r.output.contains("firewall-cmd --permanent --add-port=2055/udp"), "{}", r.output);
         assert!(r.output.contains("flowpilot status"), "{}", r.output);
         assert!(!r.output.contains("s3cret"));
+    }
+
+    #[test]
+    fn secret_command_install_writes_no_key_file_and_upgrade_keeps_it() {
+        let cmd = "vault kv get -field=secret secret/flowpilot";
+        let mut sys = host();
+        let a = ["--yes", "--pce", "pce.example.com:8443", "--api-user", "api_1", "--api-secret-command", cmd];
+        let r = run(&mut sys, &a, Ok(()), vec![]);
+        assert_eq!((r.code, r.checks), (0, 1), "{}", r.output);
+        assert!(sys.file(KEY).is_none());
+        let config = String::from_utf8(sys.file(CONFIG).unwrap().data.clone()).unwrap();
+        assert!(config.contains(&format!("api_user: api_1\napi_secret_command: {cmd}\n")), "{config}");
+        assert!(!config.contains("api_key"), "{config}");
+        assert!(String::from_utf8_lossy(&sys.file(UNIT).unwrap().data).contains("EnvironmentFile=-/etc/flowpilot/env\n"));
+        // A run without answers (an upgrade) keeps it and checks through it.
+        let before = sys.log.len();
+        let r = run(&mut sys, &["--yes"], Ok(()), vec![]);
+        assert_eq!((r.code, r.checks), (0, 1), "{}", r.output);
+        assert_eq!(sys.log[before..], [] as [String; 0]);
+        // Flags that give the secret another way are refused with it.
+        let dir = tempfile::tempdir().unwrap();
+        let r = run(&mut host(), &argv(&flags(&dir, &["--api-secret-command", cmd])), Ok(()), vec![]);
+        assert_eq!(r.code, 2, "{}", r.output);
+        assert!(r.output.contains("--api-secret-command cannot be combined"), "{}", r.output);
     }
 
     #[test]

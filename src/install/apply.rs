@@ -149,12 +149,13 @@ pub fn plan(a: &Answers, current: &Current, o: &PlanOptions) -> Vec<Action> {
         restart = true;
     }
     if !o.keep_config {
-        let key = render::api_key_file(a).into_bytes();
+        // With a secret command there is no key file to write.
+        let key = a.api_secret_command.is_none().then(|| render::api_key_file(a).into_bytes());
         let config = render::config_yaml(a, &o.stats_listen).into_bytes();
         if current.config.as_ref().is_some_and(|c| *c != config) {
             v.push(Action::BackupConfig { to: p(&format!("{CONFIG}.{}.bak", o.backup_stamp)) });
         }
-        if current.key.as_ref() != Some(&key) {
+        if let Some(key) = key.filter(|k| current.key.as_ref() != Some(k)) {
             v.push(Action::WriteFile { path: p(KEY), contents: key, mode: 0o640, owner: Owner::ROOT_FLOWPILOT });
             restart = true;
         }
@@ -313,6 +314,7 @@ mod tests {
             org_id: 1,
             api_user: "api_1".into(),
             api_secret: Secret("s3cret".into()),
+            api_secret_command: None,
             collectors: vec![CollectorArg { kind: CollectorKind::Netflow, ports: "2055".into(), remote_addrs: None }],
             text: TextArgs::default(),
             unmanaged: None,
@@ -371,6 +373,22 @@ mod tests {
             Action::EnableNow,
         ];
         assert_eq!(got, want);
+    }
+
+    #[test]
+    fn secret_command_plan_writes_no_key_file() {
+        let a = Answers {
+            api_secret: Secret(String::new()),
+            api_secret_command: Some("vault kv get -field=secret secret/flowpilot".into()),
+            ..answers()
+        };
+        let got = plan(&a, &fresh(), &opts());
+        assert!(!got.iter().any(|x| matches!(x, Action::WriteFile { path, .. } if path == Path::new(KEY))), "{got:?}");
+        assert!(got.iter().any(|x| matches!(x, Action::WriteFile { path, .. } if path == Path::new(CONFIG))), "{got:?}");
+        // Installed that way, a re-run changes nothing.
+        let mut cur = installed(&a);
+        cur.key = None;
+        assert_eq!(plan(&a, &cur, &opts()), vec![]);
     }
 
     #[test]

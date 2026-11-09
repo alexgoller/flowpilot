@@ -143,6 +143,10 @@ impl Limit {
 /// How long to wait for the pipes once the command has exited.
 const EXIT_GRACE: Duration = Duration::from_secs(1);
 
+/// Most bytes kept per stream of a limited command; the rest is read and dropped, so a process the command leaves
+/// writing cannot grow the buffer without end.
+const MAX_KEPT: usize = 1 << 20;
+
 /// `Command::output` with a limit. The command runs in its own process group: at the limit the group is killed, so
 /// whatever it started (a script's `sleep`, say) stops too. Once the command has exited, its pipes are read for at
 /// most `EXIT_GRACE` more: a process it left running may hold them, and is neither waited for nor stopped (with the
@@ -197,7 +201,11 @@ impl Pipe {
             loop {
                 match r.read(&mut chunk) {
                     Ok(0) => break,
-                    Ok(n) => out.lock().unwrap_or_else(PoisonError::into_inner).extend_from_slice(&chunk[..n]),
+                    Ok(n) => {
+                        let mut b = out.lock().unwrap_or_else(PoisonError::into_inner);
+                        let keep = n.min(MAX_KEPT - b.len());
+                        b.extend_from_slice(&chunk[..keep]);
+                    }
                     Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
                     Err(_) => break,
                 }
@@ -502,18 +510,39 @@ mod tests {
     fn limit_kills_the_whole_process_group() {
         let dir = tempfile::tempdir().unwrap();
         let pid = dir.path().join("pid");
-        let hang = script(&dir, "hang", &format!("sleep 60 &\necho $! > {}\nwait", pid.display()));
+        // The pid file comes first; the limit leaves the script ample time to write it.
+        let hang = script(&dir, "hang", &format!("sleep 60 & echo $! > {}\nwait", pid.display()));
         let t = Instant::now();
-        let err = secret_command(&hang, Duration::from_secs(1)).unwrap_err();
+        let err = secret_command(&hang, Duration::from_secs(5)).unwrap_err();
         assert!(matches!(err, Failure::Timeout { .. }), "{err:?}");
-        assert!(t.elapsed() < Duration::from_secs(4), "{:?}", t.elapsed());
+        assert!(t.elapsed() < Duration::from_secs(8), "{:?}", t.elapsed());
         let pid: i32 = std::fs::read_to_string(&pid).unwrap().trim().parse().unwrap();
-        // Killed, then reaped by init once orphaned.
-        let gone = (0..40).any(|_| {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !dead(pid) {
+            assert!(Instant::now() < deadline, "the background sleep survived");
             std::thread::sleep(Duration::from_millis(50));
-            (unsafe { libc::kill(pid, 0) }) != 0
-        });
-        assert!(gone, "the background sleep survived");
+        }
+    }
+
+    /// Gone, or a zombie (killed, but not reaped where PID 1 does not reap, as in some containers).
+    fn dead(pid: i32) -> bool {
+        if (unsafe { libc::kill(pid, 0) }) != 0 {
+            return true;
+        }
+        // Linux: the state follows the parenthesized command name. Elsewhere the kill check alone decides.
+        std::fs::read_to_string(format!("/proc/{pid}/stat"))
+            .ok()
+            .and_then(|s| s.rsplit_once(')').map(|(_, rest)| rest.trim_start().starts_with('Z')))
+            .unwrap_or(false)
+    }
+
+    #[test]
+    fn limited_command_keeps_at_most_a_mebibyte_per_stream() {
+        let dir = tempfile::tempdir().unwrap();
+        let huge = script(&dir, "huge", "head -c 3000000 /dev/zero | tr '\\0' a");
+        let out = run_command(&huge, Some(Limit::new(Duration::from_secs(10)))).unwrap();
+        assert_eq!(out.len(), MAX_KEPT);
+        assert_eq!(MAX_KEPT, 1 << 20);
     }
 
     #[test]

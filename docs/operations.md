@@ -109,7 +109,8 @@ sudo flowpilot install --yes --pce pce.example.com:8443 --org 1 --api-user api_1
   file. The file is read again after a 401 too.
 - The command line is split on whitespace and run without a shell. For pipes or quoting, point it at a script.
 - The command should not leave processes running. FlowPilot stops reading its output one second after it exits;
-  a process it left behind that still holds the output is neither waited for nor stopped. At the 30-second limit the
+  a process it left behind that still holds the output is neither waited for nor stopped. At most 1 MiB of each of
+  standard output and standard error is kept. At the 30-second limit the
   command and everything it started in its process group are killed.
 
 ### Upgrade, rollback, status, uninstall

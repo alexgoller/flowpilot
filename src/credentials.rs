@@ -27,8 +27,9 @@ pub struct Credentials {
     origin: Origin,
     /// User and token.
     current: Mutex<(String, String)>,
-    /// When the credentials were last read; held for a whole re-read, so concurrent callers wait for it.
-    last_read: Mutex<Instant>,
+    /// When the credentials were last read (`None`: long enough ago); held for a whole re-read, so concurrent
+    /// callers wait for it.
+    last_read: Mutex<Option<Instant>>,
     min_interval: Duration,
     timeout: Duration,
 }
@@ -47,7 +48,7 @@ impl Credentials {
         Arc::new(Self {
             origin: Origin::Fixed { user, token },
             current,
-            last_read: Mutex::new(Instant::now()),
+            last_read: Mutex::new(Some(Instant::now())),
             min_interval: REFRESH_INTERVAL,
             timeout: COMMAND_TIMEOUT,
         })
@@ -65,7 +66,7 @@ impl Credentials {
         Ok(Arc::new(Self {
             origin,
             current: Mutex::new(current),
-            last_read: Mutex::new(Instant::now()),
+            last_read: Mutex::new(Some(Instant::now())),
             min_interval,
             timeout,
         }))
@@ -87,12 +88,12 @@ impl Credentials {
         if self.current().1 != seen_token {
             return true;
         }
-        if last.elapsed() < self.min_interval {
+        if last.is_some_and(|t| t.elapsed() < self.min_interval) {
             return false;
         }
         log_line!("PCE answered 401, reading the API credentials again");
         let result = read(&self.origin, Some(self.timeout));
-        *last = Instant::now();
+        *last = Some(Instant::now());
         match result {
             Ok(new) => {
                 let mut cur = self.current.lock().unwrap_or_else(PoisonError::into_inner);
@@ -111,10 +112,9 @@ impl Credentials {
 
 #[cfg(test)]
 impl Credentials {
-    /// Moves the last read `by` into the past.
-    fn backdate(&self, by: Duration) {
-        let mut last = self.last_read.lock().unwrap();
-        *last = last.checked_sub(by).expect("a monotonic clock that old");
+    /// As if the last read were longer ago than any interval.
+    fn forget_last_read(&self) {
+        *self.last_read.lock().unwrap() = None;
     }
 }
 
@@ -241,7 +241,7 @@ pub(crate) mod tests {
         assert!(logs.is_empty(), "{logs:?}");
         assert_eq!(runs(dir.path()), 1);
         // 61 s later: one read, then the interval starts again.
-        c.backdate(Duration::from_secs(61));
+        c.forget_last_read();
         assert!(!c.refresh("s1"));
         assert!(!c.refresh("s1"));
         assert_eq!(runs(dir.path()), 2);

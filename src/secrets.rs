@@ -5,7 +5,7 @@ use std::io::Read;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Output, Stdio};
-use std::sync::mpsc;
+use std::sync::{mpsc, Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 /// How long `api_secret_command` (and an `api_key` source re-read after a 401) may run.
@@ -83,10 +83,10 @@ pub(crate) fn read_key_source(s: &str) -> Result<String, Failure> {
     read_key_source_within(s, None)
 }
 
-/// `read_key_source`; a `$command` is killed after `timeout` when one is given.
-fn read_key_source_within(s: &str, timeout: Option<Duration>) -> Result<String, Failure> {
+/// `read_key_source`; a `$command` is killed at `limit` when one is given.
+fn read_key_source_within(s: &str, limit: Option<Limit>) -> Result<String, Failure> {
     match s.strip_prefix('$') {
-        Some(cmd) => run_command(cmd, timeout),
+        Some(cmd) => run_command(cmd, limit),
         None => read_key_file(s),
     }
 }
@@ -94,15 +94,15 @@ fn read_key_source_within(s: &str, timeout: Option<Duration>) -> Result<String, 
 /// `api_secret_command`: the command line itself (no leading `$`), run like a `$command` but killed after `timeout`.
 /// Its output is the secret: one word, nothing else.
 pub(crate) fn secret_command(cmdline: &str, timeout: Duration) -> Result<String, Failure> {
-    let secret = run_command(cmdline, Some(timeout))?;
+    let secret = run_command(cmdline, Some(Limit::new(timeout)))?;
     if secret.is_empty() || secret.contains(char::is_whitespace) {
         return Err(Failure::Message("API secret command printed no usable secret"));
     }
     Ok(secret)
 }
 
-/// Runs a `$command`: whitespace split, PATH lookup, stdin /dev/null, trimmed stdout; killed after `timeout`.
-fn run_command(cmdline: &str, timeout: Option<Duration>) -> Result<String, Failure> {
+/// Runs a `$command`: whitespace split, PATH lookup, stdin /dev/null, trimmed stdout; killed at `limit`.
+fn run_command(cmdline: &str, limit: Option<Limit>) -> Result<String, Failure> {
     let f: Vec<&str> = cmdline.split_whitespace().collect();
     // Divergence: FlowLink panics (exit 2) on an empty command; we log `Command failed: ` and exit 1.
     let Some((name, args)) = f.split_first() else {
@@ -112,7 +112,7 @@ fn run_command(cmdline: &str, timeout: Option<Duration>) -> Result<String, Failu
     let path = look_path(name).ok_or_else(|| Failure::Command(String::new()))?;
     let mut cmd = Command::new(path);
     cmd.arg0(name).args(args).stdin(Stdio::null());
-    let out = match timeout {
+    let out = match limit {
         None => cmd.output().map_err(|_| Failure::Command(String::new()))?,
         Some(limit) => output_within(cmd, limit).map_err(|f| match f {
             Failure::Timeout { after, .. } => Failure::Timeout { program: name.to_string(), after },
@@ -127,11 +127,27 @@ fn run_command(cmdline: &str, timeout: Option<Duration>) -> Result<String, Failu
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
-/// `Command::output` with a limit. The command runs in its own process group, so killing the group at the limit
-/// also stops whatever it started (a script's `sleep`, say) and nothing keeps its pipes open.
-fn output_within(mut cmd: Command, limit: Duration) -> Result<Output, Failure> {
-    let deadline = Instant::now() + limit;
-    let timed_out = || Failure::Timeout { program: String::new(), after: limit };
+/// A time limit for commands: one deadline for everything run under it (both runs of a two-word `$command`).
+#[derive(Clone, Copy)]
+pub(crate) struct Limit {
+    after: Duration,
+    deadline: Instant,
+}
+
+impl Limit {
+    pub(crate) fn new(after: Duration) -> Self {
+        Self { after, deadline: Instant::now() + after }
+    }
+}
+
+/// How long to wait for the pipes once the command has exited.
+const EXIT_GRACE: Duration = Duration::from_secs(1);
+
+/// `Command::output` with a limit. The command runs in its own process group: at the limit the group is killed, so
+/// whatever it started (a script's `sleep`, say) stops too. Once the command has exited, its pipes are read for at
+/// most `EXIT_GRACE` more: a process it left running may hold them, and is neither waited for nor stopped (with the
+/// command reaped, its group id is no longer safe to signal).
+fn output_within(mut cmd: Command, limit: Limit) -> Result<Output, Failure> {
     let mut child = cmd
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -139,29 +155,21 @@ fn output_within(mut cmd: Command, limit: Duration) -> Result<Output, Failure> {
         .spawn()
         .map_err(|_| Failure::Command(String::new()))?;
     let kill = |child: &mut std::process::Child| {
-        // SAFETY: plain syscall; the group id is the child's pid (`process_group(0)`).
+        // SAFETY: plain syscall. The group id is the child's pid (`process_group(0)`), and the child is not reaped
+        // yet, so the id cannot have been reused.
         unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
         let _ = child.kill();
         let _ = child.wait();
     };
-    let reader = |mut r: Box<dyn Read + Send>| {
-        let (tx, rx) = mpsc::channel();
-        std::thread::spawn(move || {
-            let mut b = Vec::new();
-            let _ = r.read_to_end(&mut b);
-            let _ = tx.send(b);
-        });
-        rx
-    };
-    let stdout = reader(Box::new(child.stdout.take().expect("piped stdout")));
-    let stderr = reader(Box::new(child.stderr.take().expect("piped stderr")));
+    let stdout = Pipe::read(child.stdout.take().expect("piped stdout"));
+    let stderr = Pipe::read(child.stderr.take().expect("piped stderr"));
     let status = loop {
         match child.try_wait() {
             Ok(Some(status)) => break status,
-            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(10)),
+            Ok(None) if Instant::now() < limit.deadline => std::thread::sleep(Duration::from_millis(10)),
             Ok(None) => {
                 kill(&mut child);
-                return Err(timed_out());
+                return Err(Failure::Timeout { program: String::new(), after: limit.after });
             }
             Err(_) => {
                 kill(&mut child);
@@ -169,15 +177,40 @@ fn output_within(mut cmd: Command, limit: Duration) -> Result<Output, Failure> {
             }
         }
     };
-    // Something the command left running may still hold the pipes: the limit covers them too.
-    let collect = |rx: mpsc::Receiver<Vec<u8>>| rx.recv_timeout(deadline.saturating_duration_since(Instant::now()));
-    match (collect(stdout), collect(stderr)) {
-        (Ok(stdout), Ok(stderr)) => Ok(Output { status, stdout, stderr }),
-        _ => {
-            // SAFETY: as above; the group may outlive its leader.
-            unsafe { libc::kill(-(child.id() as libc::pid_t), libc::SIGKILL) };
-            Err(timed_out())
-        }
+    let until = Instant::now() + EXIT_GRACE;
+    Ok(Output { status, stdout: stdout.take(until), stderr: stderr.take(until) })
+}
+
+/// A pipe read to its end by a thread of its own.
+struct Pipe {
+    buf: Arc<Mutex<Vec<u8>>>,
+    closed: mpsc::Receiver<()>,
+}
+
+impl Pipe {
+    fn read(mut r: impl Read + Send + 'static) -> Self {
+        let buf: Arc<Mutex<Vec<u8>>> = Arc::default();
+        let (tx, closed) = mpsc::channel();
+        let out = buf.clone();
+        std::thread::spawn(move || {
+            let mut chunk = [0u8; 8192];
+            loop {
+                match r.read(&mut chunk) {
+                    Ok(0) => break,
+                    Ok(n) => out.lock().unwrap_or_else(PoisonError::into_inner).extend_from_slice(&chunk[..n]),
+                    Err(e) if e.kind() == std::io::ErrorKind::Interrupted => {}
+                    Err(_) => break,
+                }
+            }
+            let _ = tx.send(());
+        });
+        Self { buf, closed }
+    }
+
+    /// Everything, when the pipe closes before `until`; else what came so far.
+    fn take(self, until: Instant) -> Vec<u8> {
+        let _ = self.closed.recv_timeout(until.saturating_duration_since(Instant::now()));
+        std::mem::take(&mut *self.buf.lock().unwrap_or_else(PoisonError::into_inner))
     }
 }
 
@@ -217,9 +250,11 @@ pub(crate) fn credentials(api_key: &str) -> Result<(String, String), Failure> {
     credentials_within(api_key, None)
 }
 
-/// `credentials`; a `$command` is killed after `timeout` when one is given.
+/// `credentials`; a `$command` is killed after `timeout` when one is given. The limit covers both runs of the
+/// two-word form together.
 pub(crate) fn credentials_within(api_key: &str, timeout: Option<Duration>) -> Result<(String, String), Failure> {
-    let read_key_source = |s: &str| read_key_source_within(s, timeout);
+    let limit = timeout.map(Limit::new);
+    let read_key_source = |s: &str| read_key_source_within(s, limit);
     let key = read_key_source(api_key)?;
     if key.contains("key_id") {
         // As in FlowLink: substring detection; user = auth_username, token = secret.
@@ -431,6 +466,54 @@ mod tests {
             ("u".into(), "t".into())
         );
         assert_eq!(std::fs::read_to_string(&log).unwrap(), "run\nrun\n");
+    }
+
+    fn script(dir: &tempfile::TempDir, name: &str, body: &str) -> String {
+        let p = write(dir, name, &format!("#!/bin/sh\n{body}\n"));
+        std::fs::set_permissions(&p, std::fs::Permissions::from_mode(0o755)).unwrap();
+        p
+    }
+
+    #[test]
+    fn limited_command_reads_more_than_a_pipe_buffer() {
+        let dir = tempfile::tempdir().unwrap();
+        let big = script(&dir, "big", "head -c 200000 /dev/zero | tr '\\0' a\nhead -c 100000 /dev/zero >&2");
+        let out = secret_command(&big, Duration::from_secs(10)).unwrap();
+        assert_eq!(out.len(), 200000);
+        assert!(out.bytes().all(|b| b == b'a'));
+    }
+
+    #[test]
+    fn limited_command_does_not_wait_for_what_it_leaves_running() {
+        // A background process still holds stdout after the command exits: its output so far counts, and the wait
+        // ends shortly after the command's exit, not at the limit. The background process is not killed.
+        let dir = tempfile::tempdir().unwrap();
+        let pid = dir.path().join("pid");
+        let left = script(&dir, "left", &format!("sleep 60 &\necho $! > {}\necho s1", pid.display()));
+        let t = Instant::now();
+        assert_eq!(secret_command(&left, Duration::from_secs(20)).unwrap(), "s1");
+        assert!(t.elapsed() < Duration::from_secs(5), "{:?}", t.elapsed());
+        let pid: i32 = std::fs::read_to_string(&pid).unwrap().trim().parse().unwrap();
+        assert_eq!(unsafe { libc::kill(pid, 0) }, 0, "the background process was killed");
+        unsafe { libc::kill(pid, libc::SIGKILL) };
+    }
+
+    #[test]
+    fn limit_kills_the_whole_process_group() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid = dir.path().join("pid");
+        let hang = script(&dir, "hang", &format!("sleep 60 &\necho $! > {}\nwait", pid.display()));
+        let t = Instant::now();
+        let err = secret_command(&hang, Duration::from_secs(1)).unwrap_err();
+        assert!(matches!(err, Failure::Timeout { .. }), "{err:?}");
+        assert!(t.elapsed() < Duration::from_secs(4), "{:?}", t.elapsed());
+        let pid: i32 = std::fs::read_to_string(&pid).unwrap().trim().parse().unwrap();
+        // Killed, then reaped by init once orphaned.
+        let gone = (0..40).any(|_| {
+            std::thread::sleep(Duration::from_millis(50));
+            (unsafe { libc::kill(pid, 0) }) != 0
+        });
+        assert!(gone, "the background sleep survived");
     }
 
     #[test]

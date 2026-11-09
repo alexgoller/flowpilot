@@ -181,8 +181,8 @@ impl Uploader {
         }
     }
 
-    /// One POST, including the immediate re-POST after the `/flowlink` 404 fallback, and after a 401 that made the
-    /// credentials change. `map_url` exists for tests (plain-HTTP server).
+    /// One POST, including the immediate re-POST after the `/flowlink` 404 fallback, and one after a 401 that made
+    /// the credentials change. `map_url` exists for tests (plain-HTTP server).
     fn post(&self, client: &Client, fd: &SpoolFile, data: &[u8], map_url: fn(String) -> String) -> Outcome {
         let mut reread = false;
         loop {
@@ -225,7 +225,8 @@ impl Uploader {
                     self.spool.delete(fd);
                     return Outcome::Done;
                 }
-                // FlowPilot extension: the secret may have been rotated. Once per file, at once when it changed.
+                // FlowPilot extension: the secret may have been rotated. When it changed, sent again at once, once per
+                // attempt (later attempts follow the backoff; re-reads are limited to one per 60 s).
                 401 => {
                     failed();
                     if let Ok(body) = resp.text() {
@@ -431,8 +432,8 @@ mod tests {
     #[test]
     fn rotated_twice_retries_only_once() {
         use crate::credentials::Origin;
-        // Every read prints a new secret: the retry gets a 401 too, and the re-read changes them again; back off
-        // all the same.
+        // Every read prints a new secret, so a second re-read would change them again: the retry's 401 must not
+        // re-read or re-POST within the same attempt.
         let (addr, rx) = serve(vec![401, 401]);
         let (mut up, fd, st, dir) = setup(addr);
         let d = dir.path().display();

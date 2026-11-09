@@ -95,6 +95,10 @@ pub fn ask_with(
     unmanaged(p, &mut a)?;
     certificate(p, &mut a)?;
     while let Err(e) = check(&a) {
+        // The command is not asked for here: checking again would run the same command.
+        if matches!(e, CheckError::SecretCommand(_)) {
+            return Err(WizardError::CheckFailed(e));
+        }
         eprintln!("{e}");
         if !p.confirm("Change the answers and check again?", true)? {
             return Err(WizardError::CheckFailed(e));
@@ -281,6 +285,23 @@ mod tests {
         let n = |q: &str| p.asked.iter().filter(|s| *s == q).count();
         assert_eq!(n("PCE address (host:port)"), 1);
         assert_eq!(n("API secret"), 2);
+    }
+
+    #[test]
+    fn wizard_stops_when_the_secret_command_fails() {
+        // The command cannot be changed in the wizard: checking again would run the same command.
+        let mut start = from_args(&InstallArgs::default(), &|_| None).unwrap();
+        start.api_secret_command = Some("/bin/get-secret".into());
+        let mut p = Script { asked: vec![], secrets: VecDeque::new(), retry: true };
+        let mut calls = 0;
+        let err = ask_with(&mut p, start, &mut |_| {
+            calls += 1;
+            Err(CheckError::SecretCommand("Command failed: sealed".into()))
+        })
+        .unwrap_err();
+        assert_eq!(err, WizardError::CheckFailed(CheckError::SecretCommand("Command failed: sealed".into())));
+        assert_eq!(calls, 1);
+        assert!(!p.asked.iter().any(|q| q == "API secret" || q == "Change the answers and check again?"), "{:?}", p.asked);
     }
 
     #[test]

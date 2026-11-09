@@ -303,6 +303,10 @@ pub fn apply(file_doc: Option<Value>, env: Env) -> Result<Option<Overlay>, Vec<S
     }
     match (get(env, API_USER), get(env, API_SECRET)) {
         (Some(user), Some(secret)) => {
+            // A file's `api_secret_command` waiting for its user from the variable stays a valid pair.
+            if !is_unset(&doc, "api_secret_command") && is_unset(&doc, "api_user") {
+                set(&mut doc, "api_user", user.as_str().into(), Source::Env(API_USER.into()));
+            }
             credentials = Some((user, Secret(secret)));
             set(&mut doc, "api_key", "".into(), Source::Env(API_USER.into()));
         }
@@ -859,6 +863,12 @@ mod tests {
         let o = ok(Some(f), &[("FLOWPILOT_API_USER", "u"), ("FLOWPILOT_API_SECRET", "s")]);
         assert_eq!(o.credentials, Some(("u".into(), Secret("s".into()))));
         assert_eq!(o.doc["api_user"], "fu");
+        // ... also when the file's command takes its user from FLOWPILOT_API_USER.
+        let mut h = file();
+        h["api_secret_command"] = cmd.into();
+        let o = ok(Some(h), &[("FLOWPILOT_API_USER", "u"), ("FLOWPILOT_API_SECRET", "s")]);
+        assert_eq!(o.credentials, Some(("u".into(), Secret("s".into()))));
+        assert_eq!(o.doc["api_user"], "u");
     }
 
     #[test]

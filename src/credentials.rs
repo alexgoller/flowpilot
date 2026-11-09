@@ -109,6 +109,15 @@ impl Credentials {
     }
 }
 
+#[cfg(test)]
+impl Credentials {
+    /// Moves the last read `by` into the past.
+    fn backdate(&self, by: Duration) {
+        let mut last = self.last_read.lock().unwrap();
+        *last = last.checked_sub(by).expect("a monotonic clock that old");
+    }
+}
+
 /// One read of `origin`; commands are killed after `timeout` when one is given.
 fn read(origin: &Origin, timeout: Option<Duration>) -> Result<(String, String), Failure> {
     match origin {
@@ -226,16 +235,30 @@ pub(crate) mod tests {
     #[test]
     fn refresh_is_rate_limited() {
         let dir = tempfile::tempdir().unwrap();
-        let c = Credentials::load_with(command(dir.path()), Duration::from_millis(300), COMMAND_TIMEOUT).unwrap();
+        let c = Credentials::load(command(dir.path())).unwrap();
         // Within the interval of the start-up read: nothing runs.
         let logs = crate::log::capture(|| assert!(!c.refresh("s1")));
         assert!(logs.is_empty(), "{logs:?}");
         assert_eq!(runs(dir.path()), 1);
-        std::thread::sleep(Duration::from_millis(350));
+        // 61 s later: one read, then the interval starts again.
+        c.backdate(Duration::from_secs(61));
         assert!(!c.refresh("s1"));
         assert!(!c.refresh("s1"));
         assert_eq!(runs(dir.path()), 2);
         assert_eq!(REFRESH_INTERVAL, Duration::from_secs(60));
+    }
+
+    #[test]
+    fn two_word_command_has_one_limit_for_both_runs() {
+        // The two-word form runs the `$command` twice; the limit covers the whole read, not each run.
+        let dir = tempfile::tempdir().unwrap();
+        let slowish = script(dir.path(), "key", "sleep 0.3\necho api_1 t1");
+        let c = Credentials::load_with(Origin::ApiKey(format!("${slowish}")), Duration::ZERO, Duration::from_millis(450))
+            .unwrap();
+        let t = Instant::now();
+        let logs = crate::log::capture(|| assert!(!c.refresh("t1")));
+        assert!(t.elapsed() < Duration::from_millis(800), "{:?}", t.elapsed());
+        assert_eq!(logs[1], format!("Command timed out after 0.45 seconds: {slowish}"));
     }
 
     #[test]

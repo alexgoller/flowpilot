@@ -356,7 +356,10 @@ by plugger's variables, are not re-read.
 - The log shows `PCE answered 401, reading the API credentials again`, then `API credentials changed` or
   `API credentials unchanged`. A read that fails logs the usual message (`Command failed: ...`,
   `Command timed out after 30 seconds: ...`) and keeps the old credentials; FlowPilot keeps running. A re-read
-  `$command` in `api_key` is also killed after 30 seconds.
+  `$command` in `api_key` is also killed after 30 seconds; for the two-word form, which runs the command twice, the
+  30 seconds cover both runs.
+- A sender waits for the re-read. If FlowPilot is stopped meanwhile, the shutdown does not wait longer for it: the
+  file stays in the data directory and is sent at the next start.
 - Flow uploads: when the credentials changed, the file is sent again at once with the new ones. Otherwise the usual
   backoff applies. The 401 counts as one failed upload either way.
 - Unmanaged workloads use the new credentials from their next PCE call, unless `unmanaged_workloads.api_key` overrides

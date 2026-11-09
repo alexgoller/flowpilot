@@ -55,7 +55,9 @@ printf '%s\n' "$SECRET" | sudo flowpilot install --yes --pce pce.example.com:844
 
 To take the secret from a key store instead, pass `--api-secret-command CMD` (or `FLOWPILOT_API_SECRET_COMMAND`)
 with `--api-user`. The installer writes `api_user` and `api_secret_command` into `config.yaml` and no key file; an
-upgrade keeps them. It cannot be combined with `--api-secret-file` or `--api-key-file`. See
+upgrade keeps them. Switching an existing install to a command leaves the old `/etc/flowpilot/api_key` in place (the
+backed-up config still refers to it); once the service runs with the command, remove it by hand:
+`sudo rm /etc/flowpilot/api_key`. It cannot be combined with `--api-secret-file` or `--api-key-file`. See
 [API secret from a key store](#api-secret-from-a-key-store).
 
 `--skip-pce-check` skips the live check for a host that is provisioned before the PCE is reachable; it prints a
@@ -106,6 +108,9 @@ sudo flowpilot install --yes --pce pce.example.com:8443 --org 1 --api-user api_1
   (`{{ with secret "secret/flowpilot" }}api_1a2b3c {{ .Data.data.secret }}{{ end }}`), with `api_key` pointing at that
   file. The file is read again after a 401 too.
 - The command line is split on whitespace and run without a shell. For pipes or quoting, point it at a script.
+- The command should not leave processes running. FlowPilot stops reading its output one second after it exits;
+  a process it left behind that still holds the output is neither waited for nor stopped. At the 30-second limit the
+  command and everything it started in its process group are killed.
 
 ### Upgrade, rollback, status, uninstall
 
@@ -409,8 +414,9 @@ the first run against Illumio's Kafka.
 
 For flow upload, the API key must be accepted by the PCE for the traffic data endpoint above. The PCE role this needs
 has not been verified for this build; use the same kind of key you used for FlowLink. A refused key shows as
-`Response Code 401` or `403` in the log, and the files stay in the spool and are retried. After a 401 the log also
-shows `PCE answered 401, reading the API credentials again` and whether they changed.
+`Response Code 401` or `403` in the log, and the files stay in the spool and are retried. When the key comes from a
+file or a command, a 401 also logs `PCE answered 401, reading the API credentials again` and whether they changed, at
+most once per 60 seconds; credentials given directly as variables are not read again and log nothing more.
 
 For unmanaged workloads (when enabled), the key needs permission to read labels, create labels, read workloads and
 create workloads. FlowPilot logs which one is missing on a 401 or 403. See

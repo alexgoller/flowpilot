@@ -258,7 +258,7 @@ Lines to know:
 
 | Line | Meaning |
 |---|---|
-| `******************** Starting FlowPilot version: 0.9.0` | Start. |
+| `******************** Starting FlowPilot version: 0.10.0` | Start. |
 | `Starting Data Consumer: <name>` | A consumer from the config is being started. |
 | `Listening for <type> messages on udp port: <port>` | A port is open. `from remote addresses: [...]` is added when `remote_addrs` is set. |
 | `Reporting flows every N minutes` | The window loop has started. |
@@ -540,7 +540,7 @@ Users install with the one-liner, which verifies the checksum before running `fl
 
 ```
 curl -fsSL https://github.com/alexgoller/flowpilot/releases/latest/download/install.sh | sh
-curl -fsSL .../install.sh | FLOWPILOT_VERSION=0.9.0 sh -s -- <flowpilot install flags>
+curl -fsSL .../install.sh | FLOWPILOT_VERSION=0.10.0 sh -s -- <flowpilot install flags>
 ```
 
 Everything after `sh -s --` is passed to `flowpilot install`. `GITHUB_TOKEN` (or a logged-in `gh`) is used when set, for

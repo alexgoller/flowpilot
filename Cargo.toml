@@ -1,6 +1,6 @@
 [package]
 name = "flowpilot"
-version = "0.9.0"
+version = "0.10.0"
 edition = "2021"
 description = "Self-installing Rust collector that sends NetFlow, IPFIX and sFlow traffic to an Illumio PCE"
 license = "Apache-2.0"

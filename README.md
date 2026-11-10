@@ -95,8 +95,8 @@ On a host that cannot reach GitHub, copy the binary over, check it against `SHA2
 
 ```
 sha256sum -c --ignore-missing SHA256SUMS
-chmod +x flowpilot-0.9.0-x86_64-linux
-sudo ./flowpilot-0.9.0-x86_64-linux install
+chmod +x flowpilot-0.10.0-x86_64-linux
+sudo ./flowpilot-0.10.0-x86_64-linux install
 ```
 
 Then check the result, and later upgrade, roll back or remove it:

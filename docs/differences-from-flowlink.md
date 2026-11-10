@@ -74,7 +74,7 @@ silently, as the original does.
   logs `Exiting.` and exits 1, as in the original, without the stack.
 - **Error lines.** An error is logged as `Error: <message>`, as in FlowLink, but without the `Line:` line that
   follows it in FlowLink: FlowPilot's log does not carry FlowLink's source file and line locations.
-- **Version text.** `-version` prints `FlowPilot version: 0.9.0`; the original printed `FlowLink version:`.
+- **Version text.** `-version` prints `FlowPilot version: 0.10.0`; the original printed `FlowLink version:`.
 - **Shutdown of idle sockets.** UDP readers check for shutdown once a second. The original only noticed after the next
   datagram arrived.
 

@@ -321,7 +321,7 @@ The log line carries the same object on one line.
 {
   "schema": "flowpilot.stats/v1",
   "time": "2026-10-22T12:10:00Z",
-  "version": "0.9.0",
+  "version": "0.10.0",
   "started_at": "2026-10-22T08:00:00Z",
   "uptime_seconds": 15000,
   "instance_id": "3f2c9a1e-5b7d-4e8f-9a0b-1c2d3e4f5a6b",

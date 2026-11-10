@@ -2,7 +2,7 @@
 # FlowPilot one-line installer: downloads a release binary, verifies its checksum, runs `flowpilot install`.
 #   curl -fsSL https://github.com/alexgoller/flowpilot/releases/latest/download/install.sh | sh -s -- [install flags]
 # Environment:
-#   FLOWPILOT_VERSION            release to install, e.g. 0.9.0 or v0.9.0 (default: latest)
+#   FLOWPILOT_VERSION            release to install, e.g. 0.10.0 or v0.10.0 (default: latest)
 #   GITHUB_TOKEN                 optional GitHub token, e.g. to avoid the anonymous API rate limit
 #   FLOWPILOT_RELEASE_BASE_URL   directory URL holding the release files (testing; skips GitHub entirely)
 # Every argument is passed on to `flowpilot install`.
